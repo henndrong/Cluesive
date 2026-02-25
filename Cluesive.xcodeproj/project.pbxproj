@@ -29,9 +29,22 @@
 		03F316592F28B4A900B6F029 /* CluesiveUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CluesiveUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		03F316822F28BFB900B6F029 /* Exceptions for "Cluesive" folder in "Cluesive" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 03F3163C2F28B4A800B6F029 /* Cluesive */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		03F3163F2F28B4A800B6F029 /* Cluesive */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				03F316822F28BFB900B6F029 /* Exceptions for "Cluesive" folder in "Cluesive" target */,
+			);
 			path = Cluesive;
 			sourceTree = "<group>";
 		};
@@ -395,8 +408,12 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 4X4RHNPM8V;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Cluesive/Info.plist;
+				INFOPLIST_KEY_NSCameraUsageDescription = "We use the camera to scan rooms";
+				INFOPLIST_KEY_NSWorldSensingUsageDescription = "We use LiDAR for room sensing";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -426,8 +443,12 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 4X4RHNPM8V;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Cluesive/Info.plist;
+				INFOPLIST_KEY_NSCameraUsageDescription = "We use the camera to scan rooms";
+				INFOPLIST_KEY_NSWorldSensingUsageDescription = "We use LiDAR for room sensing";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
