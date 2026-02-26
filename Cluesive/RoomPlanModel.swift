@@ -1254,64 +1254,54 @@ final class RoomPlanModel: NSObject, ObservableObject {
 
     func refreshAnchorTargetPreview() {
         guard isAnchorModePresented else {
-            anchorTargetPreviewText = nil
-            anchorTargetingReady = false
-            consecutiveValidRaycastFrames = 0
+            applyAnchorTargetPreviewState(AnchorManager.inactiveTargetPreviewState())
             return
         }
 
         guard anchorPlacementMode == .aimedRaycast else {
-            consecutiveValidRaycastFrames = 0
-            latestAnchorTargetPreview = AnchorTargetPreview(
-                isTargetValid: true,
-                worldPosition: currentPoseTransform?.translation,
-                reason: nil,
-                surfaceKind: "device_pose"
+            let baseEligibility = validateAnchorPlacementEligibility()
+            applyAnchorTargetPreviewState(
+                AnchorManager.hereModeTargetPreviewState(
+                    currentPoseTransform: currentPoseTransform,
+                    baseEligibility: baseEligibility
+                )
             )
-            anchorTargetingReady = validateAnchorPlacementEligibility().allowed
-            anchorTargetPreviewText = anchorTargetingReady ? "Here mode: saves current phone position" : validateAnchorPlacementEligibility().reason
             return
         }
 
         guard let view = sceneView else {
-            latestAnchorTargetPreview = AnchorTargetPreview(isTargetValid: false, worldPosition: nil, reason: "AR view not ready", surfaceKind: nil)
-            anchorTargetPreviewText = latestAnchorTargetPreview.reason
-            anchorTargetingReady = false
-            consecutiveValidRaycastFrames = 0
+            applyAnchorTargetPreviewState(AnchorManager.unavailableRaycastPreviewState(reason: "AR view not ready"))
             return
         }
 
         let center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
         guard let query = view.raycastQuery(from: center, allowing: .estimatedPlane, alignment: .any) else {
-            latestAnchorTargetPreview = AnchorTargetPreview(isTargetValid: false, worldPosition: nil, reason: "No target surface in center view", surfaceKind: nil)
-            anchorTargetPreviewText = latestAnchorTargetPreview.reason
-            anchorTargetingReady = false
-            consecutiveValidRaycastFrames = 0
+            applyAnchorTargetPreviewState(AnchorManager.unavailableRaycastPreviewState(reason: "No target surface in center view"))
             return
         }
 
         let results = view.session.raycast(query)
         if let hit = results.first {
             let hitPos = hit.worldTransform.translation
-            latestAnchorTargetPreview = AnchorTargetPreview(
-                isTargetValid: true,
-                worldPosition: hitPos,
-                reason: nil,
-                surfaceKind: "\(hit.target)"
-            )
-            consecutiveValidRaycastFrames += 1
             let baseOK = validateAnchorPlacementEligibility().allowed
-            anchorTargetingReady = baseOK && consecutiveValidRaycastFrames >= 3
-            anchorTargetPreviewText = String(
-                format: anchorTargetingReady ? "Target locked %.2fm" : "Hold steady on target %.2fm",
-                simd_distance(hitPos, currentPoseTransform?.translation ?? hitPos)
+            let state = AnchorManager.raycastHitPreviewState(
+                hitPosition: hitPos,
+                hitSurfaceKind: "\(hit.target)",
+                currentPoseTransform: currentPoseTransform,
+                baseEligibility: (baseOK, nil),
+                previousConsecutiveValidFrames: consecutiveValidRaycastFrames
             )
+            applyAnchorTargetPreviewState(state)
         } else {
-            latestAnchorTargetPreview = AnchorTargetPreview(isTargetValid: false, worldPosition: nil, reason: "No target surface in center view", surfaceKind: nil)
-            anchorTargetPreviewText = latestAnchorTargetPreview.reason
-            anchorTargetingReady = false
-            consecutiveValidRaycastFrames = 0
+            applyAnchorTargetPreviewState(AnchorManager.unavailableRaycastPreviewState(reason: "No target surface in center view"))
         }
+    }
+
+    private func applyAnchorTargetPreviewState(_ state: AnchorManager.TargetPreviewState) {
+        latestAnchorTargetPreview = state.preview
+        anchorTargetPreviewText = state.previewText
+        anchorTargetingReady = state.targetingReady
+        consecutiveValidRaycastFrames = state.consecutiveValidRaycastFrames
     }
 
     private func persistAnchorsWithStatus(success: String) {

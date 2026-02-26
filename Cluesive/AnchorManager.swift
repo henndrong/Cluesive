@@ -9,6 +9,13 @@ import Foundation
 import ARKit
 
 enum AnchorManager {
+    struct TargetPreviewState {
+        let preview: AnchorTargetPreview
+        let previewText: String?
+        let targetingReady: Bool
+        let consecutiveValidRaycastFrames: Int
+    }
+
     static func defaultAnchorName(for type: AnchorType, existingAnchors: [SavedSemanticAnchor]) -> String {
         let base = type.defaultNamePrefix
         let sameTypeCount = existingAnchors.filter { $0.type == type }.count
@@ -152,6 +159,66 @@ enum AnchorManager {
 
     static func headingFromTransform(_ transform: simd_float4x4) -> Float {
         transform.forwardYawRadians
+    }
+
+    static func inactiveTargetPreviewState() -> TargetPreviewState {
+        TargetPreviewState(
+            preview: AnchorTargetPreview(isTargetValid: false, worldPosition: nil, reason: "No target", surfaceKind: nil),
+            previewText: nil,
+            targetingReady: false,
+            consecutiveValidRaycastFrames: 0
+        )
+    }
+
+    static func hereModeTargetPreviewState(
+        currentPoseTransform: simd_float4x4?,
+        baseEligibility: (allowed: Bool, reason: String?)
+    ) -> TargetPreviewState {
+        TargetPreviewState(
+            preview: AnchorTargetPreview(
+                isTargetValid: true,
+                worldPosition: currentPoseTransform?.translation,
+                reason: nil,
+                surfaceKind: "device_pose"
+            ),
+            previewText: baseEligibility.allowed ? "Here mode: saves current phone position" : baseEligibility.reason,
+            targetingReady: baseEligibility.allowed,
+            consecutiveValidRaycastFrames: 0
+        )
+    }
+
+    static func unavailableRaycastPreviewState(reason: String) -> TargetPreviewState {
+        TargetPreviewState(
+            preview: AnchorTargetPreview(isTargetValid: false, worldPosition: nil, reason: reason, surfaceKind: nil),
+            previewText: reason,
+            targetingReady: false,
+            consecutiveValidRaycastFrames: 0
+        )
+    }
+
+    static func raycastHitPreviewState(
+        hitPosition: SIMD3<Float>,
+        hitSurfaceKind: String,
+        currentPoseTransform: simd_float4x4?,
+        baseEligibility: (allowed: Bool, reason: String?),
+        previousConsecutiveValidFrames: Int,
+        requiredStableFrames: Int = 3
+    ) -> TargetPreviewState {
+        let consecutive = previousConsecutiveValidFrames + 1
+        let ready = baseEligibility.allowed && consecutive >= requiredStableFrames
+        let distance = simd_distance(hitPosition, currentPoseTransform?.translation ?? hitPosition)
+        let text = String(format: ready ? "Target locked %.2fm" : "Hold steady on target %.2fm", distance)
+        return TargetPreviewState(
+            preview: AnchorTargetPreview(
+                isTargetValid: true,
+                worldPosition: hitPosition,
+                reason: nil,
+                surfaceKind: hitSurfaceKind
+            ),
+            previewText: text,
+            targetingReady: ready,
+            consecutiveValidRaycastFrames: consecutive
+        )
     }
 
     private static func resolvedName(_ requestedName: String, type: AnchorType, existingAnchors: [SavedSemanticAnchor]) -> String {
