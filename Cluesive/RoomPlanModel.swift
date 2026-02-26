@@ -1145,19 +1145,14 @@ final class RoomPlanModel: NSObject, ObservableObject {
             return
         }
 
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalName = trimmedName.isEmpty ? nextDefaultAnchorName(for: type) : trimmedName
-        let anchor = SavedSemanticAnchor(
-            id: UUID(),
-            name: finalName,
+        let anchor = AnchorManager.createCurrentPoseAnchor(
             type: type,
-            createdAt: Date(),
-            transform: transform.flatArray,
-            placementMode: .currentPose
+            requestedName: name,
+            transform: transform,
+            existingAnchors: anchors
         )
-
         anchors.append(anchor)
-        persistAnchorsWithStatus(success: "Added anchor: \(finalName)")
+        persistAnchorsWithStatus(success: "Added anchor: \(anchor.name)")
         anchorDraftName = ""
     }
 
@@ -1172,37 +1167,31 @@ final class RoomPlanModel: NSObject, ObservableObject {
             return
         }
 
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalName = trimmedName.isEmpty ? nextDefaultAnchorName(for: type) : trimmedName
-        let anchorTransform = simd_float4x4(anchorWorldPosition: worldPosition)
-        let anchor = SavedSemanticAnchor(
-            id: UUID(),
-            name: finalName,
+        let anchor = AnchorManager.createAimedAnchor(
             type: type,
-            createdAt: Date(),
-            transform: anchorTransform.flatArray,
-            placementMode: .aimedRaycast
+            requestedName: name,
+            worldPosition: worldPosition,
+            existingAnchors: anchors
         )
         anchors.append(anchor)
-        persistAnchorsWithStatus(success: "Added aimed anchor: \(finalName)")
+        persistAnchorsWithStatus(success: "Added aimed anchor: \(anchor.name)")
         anchorDraftName = ""
     }
 
     func renameAnchor(id: UUID, newName: String) {
-        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            anchorOperationMessage = "Anchor name cannot be empty"
-            return
+        let result = AnchorManager.renameAnchor(&anchors, id: id, newName: newName)
+        if let message = result.successMessage {
+            persistAnchorsWithStatus(success: message)
+        } else if let message = result.errorMessage {
+            if message != "Anchor not found" {
+                anchorOperationMessage = message
+            }
         }
-        guard let idx = anchors.firstIndex(where: { $0.id == id }) else { return }
-        anchors[idx].name = trimmed
-        persistAnchorsWithStatus(success: "Renamed anchor to \(trimmed)")
     }
 
     func deleteAnchor(id: UUID) {
-        guard let idx = anchors.firstIndex(where: { $0.id == id }) else { return }
-        let removed = anchors.remove(at: idx)
-        persistAnchorsWithStatus(success: "Deleted anchor: \(removed.name)")
+        guard let message = AnchorManager.deleteAnchor(&anchors, id: id) else { return }
+        persistAnchorsWithStatus(success: message)
     }
 
     func pingAnchor(id: UUID) {
@@ -1218,19 +1207,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
             return
         }
 
-        let ping = distanceAndBearing(from: currentTransform, to: anchorTransform, anchorID: anchor.id, anchorName: anchor.name)
-        let absBearing = abs(ping.bearingDegrees)
-        let turnText: String
-        if ping.distanceMeters < 0.4 {
-            turnText = "nearby"
-        } else if absBearing <= 10 {
-            turnText = "ahead"
-        } else if ping.bearingDegrees < 0 {
-            turnText = "turn left \(Int(absBearing.rounded()))°"
-        } else {
-            turnText = "turn right \(Int(absBearing.rounded()))°"
-        }
-        anchorPingText = String(format: "%@: %.2fm, %@", ping.anchorName, ping.distanceMeters, turnText)
+        let ping = AnchorManager.distanceAndBearing(from: currentTransform, to: anchorTransform, anchorID: anchor.id, anchorName: anchor.name)
+        anchorPingText = AnchorManager.pingSummary(from: ping)
         anchorOperationMessage = "Pinged \(ping.anchorName)"
     }
 
@@ -1248,31 +1226,24 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func validateAnchorPlacementEligibility() -> (allowed: Bool, reason: String?) {
-        guard currentPoseTransform != nil else {
-            return (false, "No current pose yet")
-        }
-        guard appLocalizationState.isUsableForAnchors else {
-            return (false, "Wait for usable alignment (ARKit relocalize or mesh alignment)")
-        }
-        guard isPoseStableForAnchorActions else {
-            return (false, "Anchor placement requires stable heading (hold steady briefly)")
-        }
         let effectiveConfidence = acceptedMeshAlignment?.confidence ?? latestLocalizationConfidence
-        guard effectiveConfidence >= anchorConfidenceThreshold else {
-            return (false, "Anchor placement requires stable alignment (confidence >= 70%)")
-        }
-        return (true, nil)
+        return AnchorManager.validateAnchorPlacementEligibility(
+            currentPoseTransform: currentPoseTransform,
+            appLocalizationState: appLocalizationState,
+            isPoseStableForAnchorActions: isPoseStableForAnchorActions,
+            effectiveConfidence: effectiveConfidence,
+            requiredConfidence: anchorConfidenceThreshold
+        )
     }
 
     func anchorActionEligibility(for mode: AnchorPlacementMode) -> (allowed: Bool, reason: String?) {
         let base = validateAnchorPlacementEligibility()
-        guard base.allowed else { return base }
-        if mode == .aimedRaycast {
-            guard anchorTargetingReady, latestAnchorTargetPreview.isTargetValid else {
-                return (false, latestAnchorTargetPreview.reason ?? "No target surface in center view")
-            }
-        }
-        return (true, nil)
+        return AnchorManager.anchorActionEligibility(
+            mode: mode,
+            baseEligibility: base,
+            anchorTargetingReady: anchorTargetingReady,
+            latestAnchorTargetPreview: latestAnchorTargetPreview
+        )
     }
 
     func currentRaycastTarget() -> SIMD3<Float>? {
@@ -1341,37 +1312,6 @@ final class RoomPlanModel: NSObject, ObservableObject {
             anchorTargetingReady = false
             consecutiveValidRaycastFrames = 0
         }
-    }
-
-    func distanceAndBearing(from current: simd_float4x4, to anchorTransform: simd_float4x4, anchorID: UUID, anchorName: String) -> AnchorPingResult {
-        let currentPosition = current.translation
-        let anchorPosition = anchorTransform.translation
-        let dx = anchorPosition.x - currentPosition.x
-        let dz = anchorPosition.z - currentPosition.z
-        let distance = sqrt(dx * dx + dz * dz)
-
-        let currentHeading = headingFromTransform(current)
-        let targetHeading = atan2(dz, dx)
-        let delta = normalizedAngle(targetHeading - currentHeading)
-
-        return AnchorPingResult(
-            anchorID: anchorID,
-            anchorName: anchorName,
-            distanceMeters: distance,
-            bearingDegrees: delta * 180 / .pi,
-            absoluteHeadingDegrees: targetHeading * 180 / .pi,
-            isReachable: true
-        )
-    }
-
-    func headingFromTransform(_ transform: simd_float4x4) -> Float {
-        transform.forwardYawRadians
-    }
-
-    private func nextDefaultAnchorName(for type: AnchorType) -> String {
-        let base = type.defaultNamePrefix
-        let sameTypeCount = anchors.filter { $0.type == type }.count
-        return "\(base) \(sameTypeCount + 1)"
     }
 
     private func persistAnchorsWithStatus(success: String) {
