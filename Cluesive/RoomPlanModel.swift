@@ -465,15 +465,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func beginRelocalizationAttempt() {
-        relocalizationAttemptState = RelocalizationAttemptState(
-            mode: .stationary360,
-            startedAt: Date(),
-            rotationAccumulatedDegrees: 0,
-            featurePointMedianRecent: 0,
-            sawRelocalizingTracking: false,
-            stableNormalFrames: 0,
-            timeoutSeconds: 10
-        )
+        relocalizationAttemptState = RelocalizationAttemptCoordinator.initialState()
         relocalizationAttemptLastYaw = nil
         relocalizationFallbackPromptText = nil
         refreshRelocalizationGuidanceUI()
@@ -493,25 +485,18 @@ final class RoomPlanModel: NSObject, ObservableObject {
         guard awaitingRelocalization || localizationState == .relocalizing else { return }
         guard var state = relocalizationAttemptState else { return }
         let _ = currentTransform
-
-        if let last = relocalizationAttemptLastYaw {
-            let delta = abs(normalizedAngle(currentYaw - last)) * 180 / .pi
-            state.rotationAccumulatedDegrees += delta
-        }
-        relocalizationAttemptLastYaw = currentYaw
-
-        if case .limited(.relocalizing) = frame.camera.trackingState {
-            state.sawRelocalizingTracking = true
-        }
-        if case .normal = frame.camera.trackingState {
-            state.stableNormalFrames += 1
-        } else {
-            state.stableNormalFrames = 0
-        }
         let recent = recentFeaturePointSamples.suffix(60)
-        state.featurePointMedianRecent = median(Array(recent))
-
+        let outcome = RelocalizationAttemptCoordinator.updateMetrics(
+            state: state,
+            previousYaw: relocalizationAttemptLastYaw,
+            currentYaw: currentYaw,
+            trackingState: frame.camera.trackingState,
+            recentFeatureMedian: median(Array(recent))
+        )
+        state = outcome.state
         relocalizationAttemptState = state
+        relocalizationAttemptLastYaw = outcome.lastYaw
+
         if shouldEscalateFromStationaryToMicroMovement() {
             escalateRelocalizationAttemptToMicroMovement()
         }
@@ -561,48 +546,37 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func shouldEscalateFromStationaryToMicroMovement() -> Bool {
-        guard let state = relocalizationAttemptState, state.mode == .stationary360 else { return false }
-        let elapsed = Date().timeIntervalSince(state.startedAt)
-        return state.rotationAccumulatedDegrees >= 330 &&
-            elapsed >= state.timeoutSeconds &&
-            state.featurePointMedianRecent >= 120 &&
-            localizationState != .localized
+        RelocalizationAttemptCoordinator.shouldEscalateToMicroMovement(
+            state: relocalizationAttemptState,
+            localizationState: localizationState
+        )
     }
 
     func escalateRelocalizationAttemptToMicroMovement() {
         guard var state = relocalizationAttemptState, state.mode == .stationary360 else { return }
-        state.mode = .microMovementFallback
-        state.startedAt = Date()
-        state.timeoutSeconds = 14
+        state = RelocalizationAttemptCoordinator.escalatedMicroMovementState(from: state)
         relocalizationAttemptState = state
-        relocalizationFallbackPromptText = microMovementRelocPrompt()
+        relocalizationFallbackPromptText = RelocalizationAttemptCoordinator.microMovementRelocPrompt()
     }
 
     func stationaryRelocPrompt(rotationDegrees: Float, featureMedian: Int) -> String {
-        if rotationDegrees < 90 {
-            return "Relocalizing (Stationary): hold position and rotate slowly. Aim at walls, corners, and furniture edges."
-        }
-        if featureMedian < 150 {
-            return "Keep rotating, and point at textured surfaces and furniture edges to improve matching."
-        }
-        if rotationDegrees < 300 {
-            return "Good coverage so far. Continue rotating slowly to complete a full sweep."
-        }
-        return "Nearly done. Finish the 360° sweep and pause briefly for a match."
+        RelocalizationAttemptCoordinator.stationaryRelocPrompt(
+            rotationDegrees: rotationDegrees,
+            featureMedian: featureMedian
+        )
     }
 
     func microMovementRelocPrompt() -> String {
-        "Take 1-2 small steps, pause, then rotate left/right slowly about 90°. Point at large previously scanned surfaces."
+        RelocalizationAttemptCoordinator.microMovementRelocPrompt()
     }
 
     func shouldTriggerMeshFallback() -> Bool {
-        guard savedMeshArtifact != nil else { return false }
-        guard let state = relocalizationAttemptState else { return false }
-        guard state.mode == .microMovementFallback else { return false }
-        guard !meshFallbackState.active else { return false }
-        guard localizationState != .localized else { return false }
-        let elapsed = Date().timeIntervalSince(state.startedAt)
-        return elapsed >= state.timeoutSeconds || (elapsed >= 8 && state.featurePointMedianRecent >= 180)
+        RelocalizationAttemptCoordinator.shouldTriggerMeshFallback(
+            hasSavedMeshArtifact: savedMeshArtifact != nil,
+            state: relocalizationAttemptState,
+            meshFallbackActive: meshFallbackState.active,
+            localizationState: localizationState
+        )
     }
 
     func beginMeshFallbackRelocalization() {
@@ -1443,44 +1417,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     private func currentRelocalizationGuidanceSnapshot() -> RelocalizationGuidanceSnapshot? {
-        guard let state = relocalizationAttemptState else { return nil }
-        let elapsed = Date().timeIntervalSince(state.startedAt)
-        let relocQuality = relocalizationAttemptQualityScore(state: state)
-        switch state.mode {
-        case .stationary360:
-            let progress = min(Int(state.rotationAccumulatedDegrees.rounded()), 360)
-            return RelocalizationGuidanceSnapshot(
-                attemptMode: state.mode,
-                attemptProgressText: "Rotation progress: \(progress)° / 360°",
-                recommendedActionText: stationaryRelocPrompt(
-                    rotationDegrees: state.rotationAccumulatedDegrees,
-                    featureMedian: state.featurePointMedianRecent
-                ),
-                stationaryAttemptReadyToEscalate: shouldEscalateFromStationaryToMicroMovement(),
-                relocalizationQualityScore: relocQuality
-            )
-        case .microMovementFallback:
-            return RelocalizationGuidanceSnapshot(
-                attemptMode: state.mode,
-                attemptProgressText: String(
-                    format: "Fallback active (%.0fs elapsed). Feature median: %d",
-                    elapsed,
-                    state.featurePointMedianRecent
-                ),
-                recommendedActionText: microMovementRelocPrompt(),
-                stationaryAttemptReadyToEscalate: false,
-                relocalizationQualityScore: relocQuality
-            )
-        }
-    }
-
-    private func relocalizationAttemptQualityScore(state: RelocalizationAttemptState) -> Float {
-        var score: Float = 0
-        if state.sawRelocalizingTracking { score += 0.20 }
-        score += min(Float(state.stableNormalFrames) / 20, 1) * 0.35
-        score += min(Float(state.featurePointMedianRecent) / 300, 1) * 0.25
-        score += min(state.rotationAccumulatedDegrees / 360, 1) * 0.20
-        return min(max(score, 0), 1)
+        RelocalizationAttemptCoordinator.currentGuidanceSnapshot(
+            state: relocalizationAttemptState,
+            localizationState: localizationState
+        )
     }
 
     private func median(_ values: [Int]) -> Int {
