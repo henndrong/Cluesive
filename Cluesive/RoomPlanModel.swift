@@ -959,51 +959,34 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func beginFallbackRelocalizationIfNeeded() {
-        guard !fallbackRelocalizationState.isActive else { return }
-        guard hasRoomSignatureArtifact, savedRoomSignatureArtifact != nil else {
-            fallbackRelocalizationText = "Fallback Reloc: Unavailable (no room signature)"
-            fallbackRelocalizationModeText = "Fallback Mode: None"
-            fallbackRelocalizationPromptText = "No saved room signature artifact. Continue ARKit relocalization or rescan/save with signature support."
-            fallbackRelocalizationConfidenceText = "Fallback confidence: 0%"
-            return
+        guard let outcome = FallbackRelocalizationCoordinator.beginOutcome(
+            currentState: fallbackRelocalizationState,
+            hasRoomSignatureArtifact: hasRoomSignatureArtifact,
+            hasSavedArtifact: savedRoomSignatureArtifact != nil
+        ) else { return }
+
+        if let state = outcome.state {
+            fallbackRelocalizationState = state
         }
-        fallbackRelocalizationState = FallbackRelocalizationState(
-            isActive: true,
-            mode: .roomPlanSignature,
-            startedAt: Date(),
-            scanProgressText: "Fallback scan started",
-            matchResult: nil,
-            failureReason: nil,
-            rotationAccumulatedDegrees: 0,
-            lastYaw: nil
-        )
-        fallbackRelocalizationActive = true
-        fallbackRelocalizationText = "Fallback Reloc: Scanning room layout"
-        fallbackRelocalizationModeText = "Fallback Mode: Room Signature"
-        fallbackRelocalizationPromptText = "Fallback active: hold position if safe and rotate slowly, aiming at long walls/openings/furniture."
-        fallbackRelocalizationConfidenceText = "Fallback confidence: 0%"
+        if let presentation = outcome.presentation {
+            applyFallbackRelocalizationPresentation(presentation)
+        }
     }
 
     func updateFallbackRelocalizationProgress(currentYaw: Float) {
         guard fallbackRelocalizationState.isActive else { return }
-        var state = fallbackRelocalizationState
-        if let last = state.lastYaw {
-            let delta = abs(normalizedAngle(currentYaw - last)) * 180 / .pi
-            state.rotationAccumulatedDegrees += delta
-        }
-        state.lastYaw = currentYaw
-        let progress = Int(min(state.rotationAccumulatedDegrees, 360).rounded())
-        state.scanProgressText = "Fallback scan progress: \(progress)° / 360°"
-
-        let elapsed = Date().timeIntervalSince(state.startedAt)
-        if state.matchResult == nil, state.rotationAccumulatedDegrees >= 180 || elapsed > 6 {
+        let outcome = FallbackRelocalizationCoordinator.updateProgress(
+            state: fallbackRelocalizationState,
+            currentYaw: currentYaw
+        )
+        fallbackRelocalizationState = outcome.state
+        if outcome.shouldRunMatch {
             runRoomSignatureMatch()
             return
         }
-        fallbackRelocalizationState = state
-        fallbackRelocalizationText = "Fallback Reloc: Scanning room layout"
-        fallbackRelocalizationModeText = "Fallback Mode: \(state.mode.displayName)"
-        fallbackRelocalizationPromptText = "Fallback active: rotate slowly 180–360° and aim at long walls, openings, and large furniture."
+        if let presentation = outcome.presentation {
+            applyFallbackRelocalizationPresentation(presentation)
+        }
     }
 
     func runRoomSignatureMatch() {
@@ -1012,13 +995,9 @@ final class RoomPlanModel: NSObject, ObservableObject {
         if let result {
             applyFallbackRelocalizationGuidance(result)
         } else {
-            var state = fallbackRelocalizationState
-            state.failureReason = "Inconclusive room-signature match"
-            state.matchResult = nil
-            fallbackRelocalizationState = state
-            fallbackRelocalizationText = "Fallback Reloc: Inconclusive"
-            fallbackRelocalizationPromptText = "Fallback layout match was inconclusive. Move toward a wall/corner, repeat a slow sweep, then continue ARKit relocalization."
-            fallbackRelocalizationConfidenceText = "Fallback confidence: 0%"
+            let outcome = FallbackRelocalizationCoordinator.matchFailureOutcome(state: fallbackRelocalizationState)
+            fallbackRelocalizationState = outcome.state
+            applyFallbackRelocalizationPresentation(outcome.presentation)
         }
     }
 
@@ -1031,56 +1010,44 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func applyFallbackRelocalizationGuidance(_ result: RoomSignatureMatchResult) {
-        var state = fallbackRelocalizationState
-        state.matchResult = result
-        fallbackRelocalizationState = state
-        fallbackRelocalizationText = result.confidence >= 0.55 ? "Fallback Reloc: Matched" : "Fallback Reloc: Low-confidence match"
-        fallbackRelocalizationModeText = "Fallback Mode: Room Signature"
-        fallbackRelocalizationPromptText = result.confidence >= 0.55
-            ? result.recommendedPrompt
-            : "Low-confidence layout hint: \(result.recommendedPrompt) If unsure, move to a wall/corner and retry."
-        fallbackRelocalizationConfidenceText = "Fallback confidence: \(Int((result.confidence * 100).rounded()))%"
-        guidanceText = fallbackRelocalizationPromptText ?? guidanceText
+        let outcome = FallbackRelocalizationCoordinator.matchSuccessOutcome(
+            state: fallbackRelocalizationState,
+            result: result
+        )
+        fallbackRelocalizationState = outcome.state
+        applyFallbackRelocalizationPresentation(outcome.presentation)
     }
 
     func resetFallbackRelocalizationState() {
-        fallbackRelocalizationState = FallbackRelocalizationState(
-            isActive: false,
-            mode: .none,
-            startedAt: Date(),
-            scanProgressText: "Idle",
-            matchResult: nil,
-            failureReason: nil,
-            rotationAccumulatedDegrees: 0,
-            lastYaw: nil
-        )
-        fallbackRelocalizationActive = false
-        fallbackRelocalizationText = "Fallback Reloc: Inactive"
-        fallbackRelocalizationModeText = "Fallback Mode: None"
-        fallbackRelocalizationPromptText = nil
-        fallbackRelocalizationConfidenceText = "Fallback confidence: 0%"
+        fallbackRelocalizationState = FallbackRelocalizationCoordinator.resetState()
+        applyFallbackRelocalizationPresentation(FallbackRelocalizationCoordinator.resetPresentation())
     }
 
     func shouldTriggerRoomSignatureFallback() -> Bool {
-        guard hasRoomSignatureArtifact else { return false }
-        guard let state = relocalizationAttemptState else { return false }
-        guard state.mode == .microMovementFallback else { return false }
-        let elapsed = Date().timeIntervalSince(state.startedAt)
-        if localizationState == .localized { return false }
-        if fallbackRelocalizationState.isActive { return false }
-        if elapsed >= state.timeoutSeconds { return true }
-        if state.featurePointMedianRecent > 180 && elapsed >= 8 { return true }
-        return false
+        FallbackRelocalizationCoordinator.shouldTriggerRoomSignatureFallback(
+            hasRoomSignatureArtifact: hasRoomSignatureArtifact,
+            relocalizationAttemptState: relocalizationAttemptState,
+            localizationState: localizationState,
+            fallbackIsActive: fallbackRelocalizationState.isActive
+        )
     }
 
     func relocalizationPipelineState() -> String {
-        if meshFallbackState.active {
-            return "ARKit primary + Mesh fallback"
+        FallbackRelocalizationCoordinator.pipelineState(
+            meshFallbackActive: meshFallbackState.active,
+            roomSignatureFallbackActive: fallbackRelocalizationState.isActive
+        )
+    }
+
+    func applyFallbackRelocalizationPresentation(_ presentation: FallbackRelocalizationCoordinator.Presentation) {
+        fallbackRelocalizationActive = presentation.isActive
+        fallbackRelocalizationText = presentation.text
+        fallbackRelocalizationModeText = presentation.modeText
+        fallbackRelocalizationPromptText = presentation.promptText
+        fallbackRelocalizationConfidenceText = presentation.confidenceText
+        if let guidance = presentation.guidanceOverride {
+            guidanceText = guidance
         }
-        if fallbackRelocalizationState.isActive {
-            return "ARKit primary + Room Signature fallback"
-        }
-        return "ARKit primary"
     }
 
     func refreshSavedMapState() {
