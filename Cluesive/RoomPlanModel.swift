@@ -1322,54 +1322,25 @@ final class RoomPlanModel: NSObject, ObservableObject {
 
         let tracking = frame.camera.trackingState
         let mapping = frame.worldMappingStatus
-
-        switch tracking {
-        case .notAvailable:
-            guidanceText = "Tracking unavailable. Move to a brighter area and restart."
-            return
-        case .limited(let reason):
-            switch reason {
-            case .initializing:
-                guidanceText = "Initializing tracking. Hold steady, then begin scanning slowly."
-            case .excessiveMotion:
-                guidanceText = "Move slower. Sweep the phone smoothly."
-            case .insufficientFeatures:
-                guidanceText = "Aim at textured surfaces, edges, and furniture."
-            case .relocalizing:
-                guidanceText = "Relocalizing. Point at previously scanned walls and large objects."
-            @unknown default:
-                guidanceText = "Tracking limited. Slow down and scan more of the room."
-            }
-            return
-        case .normal:
-            break
-        }
-
-        if mapping == .limited || mapping == .notAvailable {
-            guidanceText = "Keep scanning walls and furniture. Pan left and right for coverage."
-            return
-        }
-
         let now = Date()
-        if now.timeIntervalSince(yawSweepWindowStart) > 4 {
+        let readinessSnapshot = computeScanReadinessSnapshot()
+        let decision = GuidanceCoordinator.scanningGuidance(
+            trackingState: tracking,
+            mappingStatus: mapping,
+            heuristics: GuidanceCoordinator.ScanHeuristicInputs(
+                now: now,
+                yawSweepWindowStart: yawSweepWindowStart,
+                yawSweepAccumulated: yawSweepAccumulated,
+                lastMovementAt: lastMovementAt,
+                mapReadinessWarningsText: mapReadinessWarningsText,
+                scanReadinessQualityScore: readinessSnapshot.qualityScore
+            )
+        )
+        if decision.shouldResetYawSweepWindow {
             yawSweepWindowStart = now
             yawSweepAccumulated = 0
         }
-
-        let stillForTooLong = now.timeIntervalSince(lastMovementAt) > 2.0
-        if stillForTooLong {
-            guidanceText = "Move slowly through the room. Scan both sides and corners."
-        } else if yawSweepAccumulated < (.pi / 6) {
-            guidanceText = "Pan left/right a bit more to improve map coverage."
-        } else if mapping == .extending {
-            guidanceText = "Good scan. Continue covering unscanned areas."
-        } else {
-            guidanceText = "Mapping looks good. You can save when coverage is complete."
-        }
-
-        if let warnings = mapReadinessWarningsText, !warnings.isEmpty, computeScanReadinessSnapshot().qualityScore < 0.65 {
-            guidanceText = "Reloc robustness hint: \(warnings)"
-        }
+        guidanceText = decision.guidanceText
     }
 
     private func currentRelocalizationGuidanceSnapshot() -> RelocalizationGuidanceSnapshot? {
