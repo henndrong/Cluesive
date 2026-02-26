@@ -1102,30 +1102,22 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func loadAnchorsFromDisk() {
-        do {
-            anchors = try Phase1MapStore.loadAnchors()
-            anchorOperationMessage = anchors.isEmpty ? nil : "Loaded \(anchors.count) anchor(s)"
-        } catch {
-            anchors = []
-            errorMessage = "Anchors load failed: \(error.localizedDescription)"
+        let result = AnchorManager.loadAnchorsFromDisk()
+        anchors = result.anchors
+        anchorOperationMessage = result.operationMessage
+        if let error = result.errorMessage {
+            errorMessage = error
         }
     }
 
     func enterAnchorMode() {
-        isAnchorModePresented = true
-        showDebugOverlay = false
-        anchorPlacementMode = .aimedRaycast
+        applyAnchorModePresentationState(AnchorManager.enterAnchorModePresentationState())
         refreshAnchorTargetPreview()
         refreshAnchorActionAvailability()
     }
 
     func exitAnchorMode() {
-        isAnchorModePresented = false
-        showDebugOverlay = true
-        anchorTargetPreviewText = nil
-        anchorModeStatusText = "Relocalize and aim at a landmark"
-        anchorTargetingReady = false
-        consecutiveValidRaycastFrames = 0
+        applyAnchorModePresentationState(AnchorManager.exitAnchorModePresentationState(currentPlacementMode: anchorPlacementMode))
         refreshAnchorActionAvailability()
     }
 
@@ -1216,9 +1208,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         let eligibility = anchorActionEligibility(for: anchorPlacementMode)
         anchorPlacementAllowed = eligibility.allowed
         anchorPlacementBlockReason = eligibility.reason
-        anchorModeStatusText = eligibility.allowed
-            ? (anchorPlacementMode == .aimedRaycast ? "Ready to place aimed anchor" : "Ready to place current-position anchor")
-            : (eligibility.reason ?? "Anchor placement unavailable")
+        anchorModeStatusText = AnchorManager.anchorModeStatusText(for: anchorPlacementMode, eligibility: eligibility)
     }
 
     func currentPoseTransformIfEligibleForAnchor() -> simd_float4x4? {
@@ -1247,9 +1237,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func currentRaycastTarget() -> SIMD3<Float>? {
-        guard latestAnchorTargetPreview.isTargetValid else { return nil }
-        guard anchorTargetingReady else { return nil }
-        return latestAnchorTargetPreview.worldPosition
+        AnchorManager.currentRaycastTarget(
+            latestAnchorTargetPreview: latestAnchorTargetPreview,
+            anchorTargetingReady: anchorTargetingReady
+        )
     }
 
     func refreshAnchorTargetPreview() {
@@ -1305,13 +1296,23 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     private func persistAnchorsWithStatus(success: String) {
-        do {
-            try Phase1MapStore.saveAnchors(anchors)
-            anchorOperationMessage = success
+        let result = AnchorManager.saveAnchors(anchors, successMessage: success)
+        if let operationMessage = result.operationMessage {
+            anchorOperationMessage = operationMessage
             errorMessage = nil
-        } catch {
-            errorMessage = "Anchors save failed: \(error.localizedDescription)"
+        } else if let error = result.errorMessage {
+            errorMessage = error
         }
+    }
+
+    private func applyAnchorModePresentationState(_ state: AnchorManager.ModePresentationState) {
+        isAnchorModePresented = state.isAnchorModePresented
+        showDebugOverlay = state.showDebugOverlay
+        anchorPlacementMode = state.anchorPlacementMode
+        anchorTargetPreviewText = state.anchorTargetPreviewText
+        anchorModeStatusText = state.anchorModeStatusText
+        anchorTargetingReady = state.anchorTargetingReady
+        consecutiveValidRaycastFrames = state.consecutiveValidRaycastFrames
     }
 
     private func runSession(initialWorldMap: ARWorldMap?) {

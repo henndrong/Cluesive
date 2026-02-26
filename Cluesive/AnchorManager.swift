@@ -9,6 +9,16 @@ import Foundation
 import ARKit
 
 enum AnchorManager {
+    struct ModePresentationState {
+        let isAnchorModePresented: Bool
+        let showDebugOverlay: Bool
+        let anchorPlacementMode: AnchorPlacementMode
+        let anchorTargetPreviewText: String?
+        let anchorModeStatusText: String
+        let anchorTargetingReady: Bool
+        let consecutiveValidRaycastFrames: Int
+    }
+
     struct TargetPreviewState {
         let preview: AnchorTargetPreview
         let previewText: String?
@@ -116,6 +126,21 @@ enum AnchorManager {
         return (true, nil)
     }
 
+    static func anchorModeStatusText(
+        for mode: AnchorPlacementMode,
+        eligibility: (allowed: Bool, reason: String?)
+    ) -> String {
+        guard eligibility.allowed else {
+            return eligibility.reason ?? "Anchor placement unavailable"
+        }
+        switch mode {
+        case .aimedRaycast:
+            return "Ready to place aimed anchor"
+        case .currentPose:
+            return "Ready to place current-position anchor"
+        }
+    }
+
     static func distanceAndBearing(
         from current: simd_float4x4,
         to anchorTransform: simd_float4x4,
@@ -159,6 +184,57 @@ enum AnchorManager {
 
     static func headingFromTransform(_ transform: simd_float4x4) -> Float {
         transform.forwardYawRadians
+    }
+
+    static func currentRaycastTarget(
+        latestAnchorTargetPreview: AnchorTargetPreview,
+        anchorTargetingReady: Bool
+    ) -> SIMD3<Float>? {
+        guard latestAnchorTargetPreview.isTargetValid else { return nil }
+        guard anchorTargetingReady else { return nil }
+        return latestAnchorTargetPreview.worldPosition
+    }
+
+    static func enterAnchorModePresentationState() -> ModePresentationState {
+        ModePresentationState(
+            isAnchorModePresented: true,
+            showDebugOverlay: false,
+            anchorPlacementMode: .aimedRaycast,
+            anchorTargetPreviewText: nil,
+            anchorModeStatusText: "Relocalize and aim at a landmark",
+            anchorTargetingReady: false,
+            consecutiveValidRaycastFrames: 0
+        )
+    }
+
+    static func exitAnchorModePresentationState(currentPlacementMode: AnchorPlacementMode) -> ModePresentationState {
+        ModePresentationState(
+            isAnchorModePresented: false,
+            showDebugOverlay: true,
+            anchorPlacementMode: currentPlacementMode,
+            anchorTargetPreviewText: nil,
+            anchorModeStatusText: "Relocalize and aim at a landmark",
+            anchorTargetingReady: false,
+            consecutiveValidRaycastFrames: 0
+        )
+    }
+
+    static func loadAnchorsFromDisk() -> (anchors: [SavedSemanticAnchor], operationMessage: String?, errorMessage: String?) {
+        do {
+            let anchors = try Phase1MapStore.loadAnchors()
+            return (anchors, anchors.isEmpty ? nil : "Loaded \(anchors.count) anchor(s)", nil)
+        } catch {
+            return ([], nil, "Anchors load failed: \(error.localizedDescription)")
+        }
+    }
+
+    static func saveAnchors(_ anchors: [SavedSemanticAnchor], successMessage: String) -> (operationMessage: String?, errorMessage: String?) {
+        do {
+            try Phase1MapStore.saveAnchors(anchors)
+            return (successMessage, nil)
+        } catch {
+            return (nil, "Anchors save failed: \(error.localizedDescription)")
+        }
     }
 
     static func inactiveTargetPreviewState() -> TargetPreviewState {
