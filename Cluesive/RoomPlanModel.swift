@@ -346,39 +346,23 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func refreshAppLocalizationUI() {
-        appLocalizationStateText = "App Localization: \(appLocalizationState.displayLabel)"
-        appLocalizationSourceText = "Localization Source: \(appLocalizationSource.displayLabel)"
-        let confidence: Float
-        switch appLocalizationState {
-        case .meshAlignedOverride:
-            confidence = acceptedMeshAlignment?.confidence ?? (meshFallbackState.result?.confidence ?? latestLocalizationConfidence)
-        case .arkitConfirmed:
-            confidence = max(latestLocalizationConfidence, acceptedMeshAlignment?.confidence ?? 0)
-        case .meshAligning:
-            confidence = meshFallbackState.result?.confidence ?? 0
-        default:
-            confidence = latestLocalizationConfidence
-        }
-        appLocalizationConfidenceText = "App localization confidence: \(Int((max(0, min(1, confidence)) * 100).rounded()))%"
-
-        switch appLocalizationState {
-        case .searching:
-            appLocalizationPromptText = "Searching for usable alignment. Scan walls/corners slowly."
-        case .meshAligning:
-            appLocalizationPromptText = "Mesh aligning in progress. Hold position if safe and rotate slowly."
-        case .meshAlignedOverride:
-            appLocalizationPromptText = "Aligned (provisional via mesh). Move slowly; ARKit still confirming."
-        case .arkitConfirmed:
-            appLocalizationPromptText = "Aligned. You can proceed."
-        case .conflict:
-            appLocalizationPromptText = "Alignment conflict detected. Stop and scan walls/corners."
-        case .degraded:
-            appLocalizationPromptText = "Alignment degraded. Move slowly and rescan strong geometry."
-        }
-
-        let arkitState = localizationState.displayText
-        arkitVsAppStateText = "ARKit: \(arkitState) | App: \(appLocalizationState.displayLabel)"
-        meshOverrideAppliedText = "World Origin Shift: \(hasAppliedWorldOriginShiftForCurrentAttempt ? "Yes" : "No")"
+        let presentation = AppLocalizationPresentationCoordinator.presentation(
+            inputs: .init(
+                appLocalizationState: appLocalizationState,
+                appLocalizationSource: appLocalizationSource,
+                acceptedMeshAlignmentConfidence: acceptedMeshAlignment?.confidence,
+                meshFallbackResultConfidence: meshFallbackState.result?.confidence,
+                latestLocalizationConfidence: latestLocalizationConfidence,
+                arkitLocalizationStateText: localizationState.displayText,
+                hasAppliedWorldOriginShift: hasAppliedWorldOriginShiftForCurrentAttempt
+            )
+        )
+        appLocalizationStateText = presentation.appLocalizationStateText
+        appLocalizationSourceText = presentation.appLocalizationSourceText
+        appLocalizationConfidenceText = presentation.appLocalizationConfidenceText
+        appLocalizationPromptText = presentation.appLocalizationPromptText
+        arkitVsAppStateText = presentation.arkitVsAppStateText
+        meshOverrideAppliedText = presentation.meshOverrideAppliedText
     }
 
     func updateScanReadinessMetrics(with frame: ARFrame, currentTransform: simd_float4x4, currentYaw: Float) {
