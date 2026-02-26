@@ -729,12 +729,19 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func updateAppLocalizationState(with frame: ARFrame, currentYaw: Float) {
-        switch RelocalizationCoordinator.appLocalizationStartAction(
+        var tickPlan = RelocalizationCoordinator.appLocalizationTickPlan(
             localizationState: localizationState,
             loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
-            meshFallbackActive: meshFallbackState.active
-        ) {
+            meshFallbackActive: meshFallbackState.active,
+            meshResult: meshFallbackState.result,
+            hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt,
+            isPoseStableForAnchorActions: isPoseStableForAnchorActions,
+            latestLocalizationConfidence: latestLocalizationConfidence,
+            meshFallbackPhase: meshFallbackState.phase
+        )
+
+        switch tickPlan.startAction {
         case .none:
             break
         case .reconcileMeshOverride:
@@ -745,11 +752,20 @@ final class RoomPlanModel: NSObject, ObservableObject {
             appLocalizationState = .meshAligning
         }
 
-        if RelocalizationCoordinator.shouldAttemptMeshAcceptance(
-            meshResult: meshFallbackState.result,
+        // Recompute after potential state transitions above.
+        tickPlan = RelocalizationCoordinator.appLocalizationTickPlan(
+            localizationState: localizationState,
+            loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
-            hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt
-        ),
+            meshFallbackActive: meshFallbackState.active,
+            meshResult: meshFallbackState.result,
+            hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt,
+            isPoseStableForAnchorActions: isPoseStableForAnchorActions,
+            latestLocalizationConfidence: latestLocalizationConfidence,
+            meshFallbackPhase: meshFallbackState.phase
+        )
+
+        if tickPlan.shouldAttemptMeshAcceptance,
            let result = meshFallbackState.result
         {
             if let acceptance = stabilizeMeshAlignmentCandidate(result) {
@@ -758,31 +774,46 @@ final class RoomPlanModel: NSObject, ObservableObject {
             }
         }
 
-        let followUps = RelocalizationCoordinator.meshOverrideFollowUpActions(
+        tickPlan = RelocalizationCoordinator.appLocalizationTickPlan(
+            localizationState: localizationState,
+            loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
-            localizationState: localizationState
+            meshFallbackActive: meshFallbackState.active,
+            meshResult: meshFallbackState.result,
+            hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt,
+            isPoseStableForAnchorActions: isPoseStableForAnchorActions,
+            latestLocalizationConfidence: latestLocalizationConfidence,
+            meshFallbackPhase: meshFallbackState.phase
         )
-        if followUps.shouldValidatePostShiftAlignment {
+
+        if tickPlan.followUpActions.shouldValidatePostShiftAlignment {
             validatePostShiftAlignment(with: frame)
         }
-        if followUps.shouldReconcileAfterPostShift {
+        if tickPlan.followUpActions.shouldReconcileAfterPostShift {
             reconcileARKitRelocalizationAgainstMeshOverride(with: frame)
         }
 
-        if RelocalizationCoordinator.shouldDegradeMeshAlignedOverride(
+        tickPlan = RelocalizationCoordinator.appLocalizationTickPlan(
+            localizationState: localizationState,
+            loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
+            meshFallbackActive: meshFallbackState.active,
+            meshResult: meshFallbackState.result,
+            hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt,
             isPoseStableForAnchorActions: isPoseStableForAnchorActions,
-            latestLocalizationConfidence: latestLocalizationConfidence
-        ) {
-            degradeAppLocalization(reason: "Pose stability and confidence dropped after mesh alignment")
+            latestLocalizationConfidence: latestLocalizationConfidence,
+            meshFallbackPhase: meshFallbackState.phase
+        )
+
+        if tickPlan.shouldDegradeMeshAlignedOverride, let reason = tickPlan.degradeReason {
+            degradeAppLocalization(reason: reason)
         }
 
-        if RelocalizationCoordinator.shouldResetMeshAligningToSearching(
-            appLocalizationState: appLocalizationState,
-            meshFallbackPhase: meshFallbackState.phase
-        ) {
+        if tickPlan.shouldResetMeshAligningToSearching {
             appLocalizationState = .searching
-            meshOverrideStatusText = RelocalizationCoordinator.meshAligningRejectedStatusText()
+            if let statusText = tickPlan.resetStatusText {
+                meshOverrideStatusText = statusText
+            }
         }
 
         let _ = currentYaw

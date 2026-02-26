@@ -21,6 +21,16 @@ enum RelocalizationCoordinator {
         let shouldReconcileAfterPostShift: Bool
     }
 
+    struct AppLocalizationTickPlan {
+        let startAction: AppLocalizationStartAction
+        let shouldAttemptMeshAcceptance: Bool
+        let followUpActions: MeshOverrideFollowUpActions
+        let shouldDegradeMeshAlignedOverride: Bool
+        let degradeReason: String?
+        let shouldResetMeshAligningToSearching: Bool
+        let resetStatusText: String?
+    }
+
     enum ReconciliationDecision {
         case noAction
         case promoteARKitConfirmed
@@ -184,6 +194,57 @@ enum RelocalizationCoordinator {
         }
 
         return .none
+    }
+
+    static func appLocalizationTickPlan(
+        localizationState: LocalizationState,
+        loadRequestedAt: Date?,
+        appLocalizationState: AppLocalizationState,
+        meshFallbackActive: Bool,
+        meshResult: MeshRelocalizationResult?,
+        hasAppliedWorldOriginShiftForCurrentAttempt: Bool,
+        isPoseStableForAnchorActions: Bool,
+        latestLocalizationConfidence: Float,
+        meshFallbackPhase: MeshFallbackPhase
+    ) -> AppLocalizationTickPlan {
+        let startAction = appLocalizationStartAction(
+            localizationState: localizationState,
+            loadRequestedAt: loadRequestedAt,
+            appLocalizationState: appLocalizationState,
+            meshFallbackActive: meshFallbackActive
+        )
+
+        let shouldAttemptAcceptance = shouldAttemptMeshAcceptance(
+            meshResult: meshResult,
+            appLocalizationState: appLocalizationState,
+            hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt
+        )
+
+        let followUpActions = meshOverrideFollowUpActions(
+            appLocalizationState: appLocalizationState,
+            localizationState: localizationState
+        )
+
+        let shouldDegrade = shouldDegradeMeshAlignedOverride(
+            appLocalizationState: appLocalizationState,
+            isPoseStableForAnchorActions: isPoseStableForAnchorActions,
+            latestLocalizationConfidence: latestLocalizationConfidence
+        )
+
+        let shouldReset = shouldResetMeshAligningToSearching(
+            appLocalizationState: appLocalizationState,
+            meshFallbackPhase: meshFallbackPhase
+        )
+
+        return AppLocalizationTickPlan(
+            startAction: startAction,
+            shouldAttemptMeshAcceptance: shouldAttemptAcceptance,
+            followUpActions: followUpActions,
+            shouldDegradeMeshAlignedOverride: shouldDegrade,
+            degradeReason: shouldDegrade ? "Pose stability and confidence dropped after mesh alignment" : nil,
+            shouldResetMeshAligningToSearching: shouldReset,
+            resetStatusText: shouldReset ? meshAligningRejectedStatusText() : nil
+        )
     }
 
     static func shouldAttemptMeshAcceptance(
