@@ -9,6 +9,18 @@ import Foundation
 import ARKit
 
 enum RelocalizationCoordinator {
+    enum AppLocalizationStartAction {
+        case none
+        case reconcileMeshOverride
+        case promoteARKitConfirmed
+        case enterMeshAligning
+    }
+
+    struct MeshOverrideFollowUpActions {
+        let shouldValidatePostShiftAlignment: Bool
+        let shouldReconcileAfterPostShift: Bool
+    }
+
     enum ReconciliationDecision {
         case noAction
         case promoteARKitConfirmed
@@ -146,6 +158,34 @@ enum RelocalizationCoordinator {
         return meshFallbackActive && appLocalizationState == .searching
     }
 
+    static func appLocalizationStartAction(
+        localizationState: LocalizationState,
+        loadRequestedAt: Date?,
+        appLocalizationState: AppLocalizationState,
+        meshFallbackActive: Bool
+    ) -> AppLocalizationStartAction {
+        if localizationState == .localized, loadRequestedAt != nil {
+            if appLocalizationState == .meshAlignedOverride {
+                return .reconcileMeshOverride
+            }
+            if appLocalizationState != .conflict {
+                return .promoteARKitConfirmed
+            }
+            return .none
+        }
+
+        if shouldEnterMeshAligning(
+            localizationState: localizationState,
+            loadRequestedAt: loadRequestedAt,
+            meshFallbackActive: meshFallbackActive,
+            appLocalizationState: appLocalizationState
+        ) {
+            return .enterMeshAligning
+        }
+
+        return .none
+    }
+
     static func shouldAttemptMeshAcceptance(
         meshResult: MeshRelocalizationResult?,
         appLocalizationState: AppLocalizationState,
@@ -178,6 +218,26 @@ enum RelocalizationCoordinator {
         meshFallbackPhase: MeshFallbackPhase
     ) -> Bool {
         appLocalizationState == .meshAligning && meshFallbackPhase == .inconclusive
+    }
+
+    static func meshAligningRejectedStatusText() -> String {
+        "Mesh Override: Rejected (inconclusive)"
+    }
+
+    static func meshOverrideFollowUpActions(
+        appLocalizationState: AppLocalizationState,
+        localizationState: LocalizationState
+    ) -> MeshOverrideFollowUpActions {
+        guard appLocalizationState == .meshAlignedOverride else {
+            return MeshOverrideFollowUpActions(
+                shouldValidatePostShiftAlignment: false,
+                shouldReconcileAfterPostShift: false
+            )
+        }
+        return MeshOverrideFollowUpActions(
+            shouldValidatePostShiftAlignment: true,
+            shouldReconcileAfterPostShift: localizationState == .localized
+        )
     }
 
     static func arkitConfirmedMeshOverrideStatusText(hasAppliedWorldOriginShift: Bool) -> String {

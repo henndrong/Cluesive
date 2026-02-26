@@ -729,18 +729,19 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func updateAppLocalizationState(with frame: ARFrame, currentYaw: Float) {
-        if localizationState == .localized, loadRequestedAt != nil {
-            if appLocalizationState == .meshAlignedOverride {
-                reconcileARKitRelocalizationAgainstMeshOverride(with: frame)
-            } else if appLocalizationState != .conflict {
-                promoteToARKitConfirmed()
-            }
-        } else if RelocalizationCoordinator.shouldEnterMeshAligning(
+        switch RelocalizationCoordinator.appLocalizationStartAction(
             localizationState: localizationState,
             loadRequestedAt: loadRequestedAt,
-            meshFallbackActive: meshFallbackState.active,
-            appLocalizationState: appLocalizationState
+            appLocalizationState: appLocalizationState,
+            meshFallbackActive: meshFallbackState.active
         ) {
+        case .none:
+            break
+        case .reconcileMeshOverride:
+            reconcileARKitRelocalizationAgainstMeshOverride(with: frame)
+        case .promoteARKitConfirmed:
+            promoteToARKitConfirmed()
+        case .enterMeshAligning:
             appLocalizationState = .meshAligning
         }
 
@@ -757,11 +758,15 @@ final class RoomPlanModel: NSObject, ObservableObject {
             }
         }
 
-        if appLocalizationState == .meshAlignedOverride {
+        let followUps = RelocalizationCoordinator.meshOverrideFollowUpActions(
+            appLocalizationState: appLocalizationState,
+            localizationState: localizationState
+        )
+        if followUps.shouldValidatePostShiftAlignment {
             validatePostShiftAlignment(with: frame)
-            if localizationState == .localized {
-                reconcileARKitRelocalizationAgainstMeshOverride(with: frame)
-            }
+        }
+        if followUps.shouldReconcileAfterPostShift {
+            reconcileARKitRelocalizationAgainstMeshOverride(with: frame)
         }
 
         if RelocalizationCoordinator.shouldDegradeMeshAlignedOverride(
@@ -777,7 +782,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
             meshFallbackPhase: meshFallbackState.phase
         ) {
             appLocalizationState = .searching
-            meshOverrideStatusText = "Mesh Override: Rejected (inconclusive)"
+            meshOverrideStatusText = RelocalizationCoordinator.meshAligningRejectedStatusText()
         }
 
         let _ = currentYaw
