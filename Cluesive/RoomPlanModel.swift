@@ -735,22 +735,24 @@ final class RoomPlanModel: NSObject, ObservableObject {
             } else if appLocalizationState != .conflict {
                 promoteToARKitConfirmed()
             }
-        } else if meshFallbackState.active, appLocalizationState == .searching {
+        } else if RelocalizationCoordinator.shouldEnterMeshAligning(
+            localizationState: localizationState,
+            loadRequestedAt: loadRequestedAt,
+            meshFallbackActive: meshFallbackState.active,
+            appLocalizationState: appLocalizationState
+        ) {
             appLocalizationState = .meshAligning
         }
 
-        if let result = meshFallbackState.result,
-           appLocalizationState != .arkitConfirmed,
-           appLocalizationState != .conflict,
-           !hasAppliedWorldOriginShiftForCurrentAttempt
+        if RelocalizationCoordinator.shouldAttemptMeshAcceptance(
+            meshResult: meshFallbackState.result,
+            appLocalizationState: appLocalizationState,
+            hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt
+        ),
+           let result = meshFallbackState.result
         {
             if let acceptance = stabilizeMeshAlignmentCandidate(result) {
-                meshOverrideStatusText = String(
-                    format: "Mesh Override: Accepted (conf %.0f%%, residual %.2fm, overlap %.0f%%)",
-                    acceptance.confidence * 100,
-                    acceptance.residualErrorMeters,
-                    acceptance.overlapRatio * 100
-                )
+                meshOverrideStatusText = RelocalizationCoordinator.acceptedMeshOverrideStatusText(acceptance)
                 promoteToMeshAlignedOverride(using: acceptance)
             }
         }
@@ -762,11 +764,18 @@ final class RoomPlanModel: NSObject, ObservableObject {
             }
         }
 
-        if appLocalizationState == .meshAlignedOverride && !isPoseStableForAnchorActions && latestLocalizationConfidence < 0.35 {
+        if RelocalizationCoordinator.shouldDegradeMeshAlignedOverride(
+            appLocalizationState: appLocalizationState,
+            isPoseStableForAnchorActions: isPoseStableForAnchorActions,
+            latestLocalizationConfidence: latestLocalizationConfidence
+        ) {
             degradeAppLocalization(reason: "Pose stability and confidence dropped after mesh alignment")
         }
 
-        if appLocalizationState == .meshAligning && meshFallbackState.phase == .inconclusive {
+        if RelocalizationCoordinator.shouldResetMeshAligningToSearching(
+            appLocalizationState: appLocalizationState,
+            meshFallbackPhase: meshFallbackState.phase
+        ) {
             appLocalizationState = .searching
             meshOverrideStatusText = "Mesh Override: Rejected (inconclusive)"
         }
@@ -795,9 +804,9 @@ final class RoomPlanModel: NSObject, ObservableObject {
         localizationConflictText = nil
         lastConflictSnapshot = nil
         conflictDisagreementFrames = 0
-        meshOverrideStatusText = hasAppliedWorldOriginShiftForCurrentAttempt
-            ? "Mesh Override: Applied; ARKit confirmed alignment"
-            : "Mesh Override: Not needed (ARKit confirmed)"
+        meshOverrideStatusText = RelocalizationCoordinator.arkitConfirmedMeshOverrideStatusText(
+            hasAppliedWorldOriginShift: hasAppliedWorldOriginShiftForCurrentAttempt
+        )
     }
 
     func degradeAppLocalization(reason: String) {
@@ -805,77 +814,32 @@ final class RoomPlanModel: NSObject, ObservableObject {
         appLocalizationState = .degraded
         localizationConflictText = nil
         meshOverrideStatusText = "Mesh Override: Degraded"
-        guidanceText = "Alignment degraded. \(reason). Face a wall/corner and rotate slowly."
+        guidanceText = RelocalizationCoordinator.degradedGuidanceText(reason: reason)
     }
 
     func enterLocalizationConflict(_ conflict: LocalizationConflictSnapshot) {
         appLocalizationState = .conflict
         lastConflictSnapshot = conflict
-        let pos = String(format: "%.2f", conflict.positionDeltaMeters)
-        let yaw = String(format: "%.0f", conflict.yawDeltaDegrees)
-        localizationConflictText = "ARKit/mesh conflict: Δpos \(pos)m, Δyaw \(yaw)°"
+        let presentation = RelocalizationCoordinator.conflictPresentation(conflict: conflict)
+        localizationConflictText = presentation.localizationConflictText
         meshOverrideStatusText = "Mesh Override: Conflict detected"
-        guidanceText = "Alignment conflict detected. Stop and scan walls/corners for re-alignment."
+        guidanceText = presentation.guidanceText
     }
 
     func evaluateMeshAlignmentCandidate(_ result: MeshRelocalizationResult) -> Bool {
-        guard result.confidence >= 0.80 else { return false }
-        guard result.residualErrorMeters <= 0.20 else { return false }
-        guard result.overlapRatio >= 0.35 else { return false }
-        guard result.yawConfidenceDegrees <= 12 else { return false }
-        guard result.supportingPointCount >= 250 else { return false }
-        return true
+        RelocalizationCoordinator.evaluateMeshAlignmentCandidate(result)
     }
 
     func stabilizeMeshAlignmentCandidate(_ result: MeshRelocalizationResult) -> MeshAlignmentAcceptance? {
-        meshAlignmentCandidateBuffer.append(result)
-        if meshAlignmentCandidateBuffer.count > 5 {
-            meshAlignmentCandidateBuffer.removeFirst(meshAlignmentCandidateBuffer.count - 5)
-        }
-        guard evaluateMeshAlignmentCandidate(result) else {
-            meshOverrideStatusText = String(
-                format: "Mesh Override: Rejected (conf %.0f%%, residual %.2fm, overlap %.0f%%)",
-                result.confidence * 100,
-                result.residualErrorMeters,
-                result.overlapRatio * 100
-            )
-            return nil
-        }
-        guard meshAlignmentCandidateBuffer.count >= 3 else {
-            meshOverrideStatusText = "Mesh Override: Candidate good, waiting for stability"
-            return nil
-        }
-
-        let recent = Array(meshAlignmentCandidateBuffer.suffix(3))
-        guard recent.allSatisfy({ evaluateMeshAlignmentCandidate($0) }) else { return nil }
-        let seeds = recent.compactMap(\.refinedPoseSeed)
-        guard seeds.count == 3, let latestSeed = seeds.last else { return nil }
-        let yawStable = seeds.dropLast().allSatisfy { angleDistanceDegrees($0.yawDegrees, latestSeed.yawDegrees) <= 10 }
-        let transStable = seeds.dropLast().allSatisfy {
-            simd_distance($0.translationXZ, latestSeed.translationXZ) <= 0.45
-        }
-        guard yawStable, transStable else {
-            meshOverrideStatusText = "Mesh Override: Candidate unstable across frames"
-            return nil
-        }
-
-        let mapFromSession = simd_float4x4(
-            yawRadians: latestSeed.yawDegrees * .pi / 180,
-            translation: SIMD3<Float>(latestSeed.translationXZ.x, 0, latestSeed.translationXZ.y)
+        let outcome = RelocalizationCoordinator.stabilizeMeshAlignmentCandidate(
+            buffer: meshAlignmentCandidateBuffer,
+            result: result
         )
-        let conf = recent.map(\.confidence).reduce(0, +) / Float(recent.count)
-        let residual = recent.map(\.residualErrorMeters).reduce(0, +) / Float(recent.count)
-        let overlap = recent.map(\.overlapRatio).reduce(0, +) / Float(recent.count)
-        let yawConf = recent.map(\.yawConfidenceDegrees).reduce(0, +) / Float(recent.count)
-        return MeshAlignmentAcceptance(
-            mapFromSessionTransform: mapFromSession,
-            confidence: conf,
-            residualErrorMeters: residual,
-            overlapRatio: overlap,
-            yawConfidenceDegrees: yawConf,
-            acceptedAt: Date(),
-            supportingFrames: recent.count
-        )
+        meshAlignmentCandidateBuffer = outcome.updatedBuffer
+        if let status = outcome.statusText {
+            meshOverrideStatusText = status
+        }
+        return outcome.acceptance
     }
 
     func applyWorldOriginShiftIfNeeded(using acceptance: MeshAlignmentAcceptance) {
@@ -913,50 +877,49 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func reconcileARKitRelocalizationAgainstMeshOverride(with frame: ARFrame) {
-        guard appLocalizationState == .meshAlignedOverride else {
-            if localizationState == .localized, loadRequestedAt != nil {
-                promoteToARKitConfirmed()
+        let conflict = computeARKitMeshDisagreement(frame: frame)
+        let decision = RelocalizationCoordinator.reconcileDecision(
+            appLocalizationState: appLocalizationState,
+            localizationState: localizationState,
+            loadRequestedAt: loadRequestedAt,
+            conflict: conflict,
+            conflictDisagreementFrames: conflictDisagreementFrames,
+            latestLocalizationConfidence: latestLocalizationConfidence
+        )
+
+        switch decision {
+        case .noAction:
+            return
+        case .promoteARKitConfirmed:
+            conflictDisagreementFrames = 0
+            promoteToARKitConfirmed()
+        case .resetConflictCounterAndPromote:
+            conflictDisagreementFrames = 0
+            promoteToARKitConfirmed()
+        case .incrementConflictCounter:
+            conflictDisagreementFrames += 1
+        case .enterConflict:
+            conflictDisagreementFrames += 1
+            if let conflict {
+                enterLocalizationConflict(conflict)
             }
-            return
-        }
-        guard let conflict = computeARKitMeshDisagreement(frame: frame) else {
-            conflictDisagreementFrames = 0
-            promoteToARKitConfirmed()
-            return
-        }
-        conflictDisagreementFrames += 1
-        if shouldTrustARKitOverMesh(conflict: conflict) {
-            conflictDisagreementFrames = 0
-            promoteToARKitConfirmed()
-            return
-        }
-        if conflictDisagreementFrames >= 5 {
-            enterLocalizationConflict(conflict)
         }
     }
 
     func computeARKitMeshDisagreement(frame: ARFrame) -> LocalizationConflictSnapshot? {
         guard let acceptance = acceptedMeshAlignment else { return nil }
-        let arkitYaw = frame.camera.transform.forwardYawRadians * 180 / .pi
-        let meshYaw = acceptance.mapFromSessionTransform.forwardYawRadians * 180 / .pi
-        let yawDelta = angleDistanceDegrees(arkitYaw, meshYaw)
-
-        let arkitPos = frame.camera.transform.translation
-        let meshPos = acceptance.mapFromSessionTransform.translation
-        let posDelta = simd_distance(SIMD2<Float>(arkitPos.x, arkitPos.z), SIMD2<Float>(meshPos.x, meshPos.z))
-
-        guard posDelta > 0.75 || yawDelta > 25 else { return nil }
-        return LocalizationConflictSnapshot(
-            positionDeltaMeters: posDelta,
-            yawDeltaDegrees: yawDelta,
-            arkitStateAtConflict: localizationState.displayText,
-            meshConfidenceAtConflict: acceptance.confidence,
-            detectedAt: Date()
+        return RelocalizationCoordinator.computeARKitMeshDisagreement(
+            frame: frame,
+            acceptance: acceptance,
+            arkitStateAtConflict: localizationState.displayText
         )
     }
 
     func shouldTrustARKitOverMesh(conflict: LocalizationConflictSnapshot) -> Bool {
-        latestLocalizationConfidence > 0.9 && conflict.meshConfidenceAtConflict < 0.82
+        RelocalizationCoordinator.shouldTrustARKitOverMesh(
+            latestLocalizationConfidence: latestLocalizationConfidence,
+            conflict: conflict
+        )
     }
 
     func beginFallbackRelocalizationIfNeeded() {
