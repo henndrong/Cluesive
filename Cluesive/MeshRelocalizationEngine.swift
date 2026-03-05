@@ -7,8 +7,14 @@
 
 import Foundation
 import ARKit
+import Vision
 
 enum MeshRelocalizationEngine {
+    struct LiveFallbackInput {
+        let points: [SIMD3<Float>]
+        let descriptor: MeshSignatureDescriptor
+    }
+
     static func buildMeshMapArtifact(from frame: ARFrame, mapName: String = Phase1MapStore.mapName) -> MeshMapArtifact? {
         let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
         guard !meshAnchors.isEmpty else { return nil }
@@ -35,11 +41,80 @@ enum MeshRelocalizationEngine {
         buildMeshMapArtifact(from: frame, mapName: "live")
     }
 
-    static func runCoarseMeshSignatureMatch(from frame: ARFrame, saved: MeshMapArtifact) -> [MeshRelocalizationHypothesis] {
-        guard let live = extractLiveMeshSnapshot(from: frame) else { return [] }
+    static func buildStructureSignature(from frame: ARFrame, mapName: String = Phase1MapStore.mapName) -> StructureSignatureArtifact? {
+        guard let mesh = buildMeshMapArtifact(from: frame, mapName: mapName) else { return nil }
+        return buildStructureSignature(from: mesh)
+    }
 
+    static func buildStructureSignature(from mesh: MeshMapArtifact) -> StructureSignatureArtifact? {
+        let descriptor = mesh.descriptor
+        guard !descriptor.dominantYawBins.isEmpty else { return nil }
+        let floorY = estimateFloorY(from: mesh)
+        let segments = estimateStructureSegments(from: descriptor)
+        return StructureSignatureArtifact(
+            mapName: mesh.mapName,
+            capturedAt: mesh.capturedAt,
+            dominantYawBins: descriptor.dominantYawBins,
+            floorYEstimate: floorY,
+            boundsMinXZ: descriptor.boundsMinXZ,
+            boundsMaxXZ: descriptor.boundsMaxXZ,
+            structuralSegments: segments,
+            version: 1
+        )
+    }
+
+    static func buildVisionIndex(from frame: ARFrame, mapName: String = Phase1MapStore.mapName) -> VisionIndexArtifact? {
+        guard let featurePrint = featurePrintData(from: frame.capturedImage) else { return nil }
+        let record = VisionFeatureRecord(
+            id: UUID(),
+            capturedAt: Date(),
+            mapFromSessionTransform: frame.camera.transform.flatArray,
+            featurePrintData: featurePrint
+        )
+        return VisionIndexArtifact(
+            mapName: mapName,
+            capturedAt: Date(),
+            records: [record],
+            version: 1
+        )
+    }
+
+    static func retrieveVisionPlaceCandidate(from frame: ARFrame, saved: VisionIndexArtifact) -> VisionPlaceCandidate? {
+        guard let live = featurePrintObservation(from: frame.capturedImage) else { return nil }
+        var best: VisionPlaceCandidate?
+        for record in saved.records {
+            guard
+                let savedObs = featurePrintObservation(from: record.featurePrintData),
+                let transform = simd_float4x4(flatArray: record.mapFromSessionTransform)
+            else { continue }
+            var distance: Float = .greatestFiniteMagnitude
+            do {
+                try live.computeDistance(&distance, to: savedObs)
+            } catch {
+                continue
+            }
+            let confidence = max(0, min(1, 1 - distance))
+            let candidate = VisionPlaceCandidate(
+                recordID: record.id,
+                mapFromSessionTransform: transform,
+                distance: distance,
+                confidence: confidence
+            )
+            if best == nil || candidate.distance < best!.distance {
+                best = candidate
+            }
+        }
+        return best
+    }
+
+    static func runCoarseMeshSignatureMatch(from frame: ARFrame, saved: MeshMapArtifact) -> [MeshRelocalizationHypothesis] {
+        guard let liveInput = buildLiveFallbackInput(from: frame) else { return [] }
+        return runCoarseMeshSignatureMatch(liveDescriptor: liveInput.descriptor, saved: saved)
+    }
+
+    static func runCoarseMeshSignatureMatch(liveDescriptor: MeshSignatureDescriptor, saved: MeshMapArtifact) -> [MeshRelocalizationHypothesis] {
         let s = saved.descriptor
-        let l = live.descriptor
+        let l = liveDescriptor
         guard !s.dominantYawBins.isEmpty, !l.dominantYawBins.isEmpty else { return [] }
         let count = min(s.dominantYawBins.count, l.dominantYawBins.count)
 
@@ -69,19 +144,77 @@ enum MeshRelocalizationEngine {
         return hypotheses.sorted { $0.coarseConfidence > $1.coarseConfidence }.prefix(3).map { $0 }
     }
 
+    static func downsampleSavedMeshPoints(_ saved: MeshMapArtifact, maxPoints: Int) -> [SIMD3<Float>] {
+        downsamplePointCloud(flatPointsToSIMD(saved.meshAnchors.flatMap(\.vertices)), maxPoints: maxPoints)
+    }
+
+    static func buildLiveFallbackInput(
+        from frame: ARFrame,
+        maxAnchors: Int = 10,
+        maxPointsPerAnchor: Int = 240,
+        maxTotalPoints: Int = 1200
+    ) -> LiveFallbackInput? {
+        let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        guard !meshAnchors.isEmpty else { return nil }
+
+        var points: [SIMD3<Float>] = []
+        points.reserveCapacity(maxTotalPoints)
+        var normals: [SIMD3<Float>] = []
+        normals.reserveCapacity(maxTotalPoints)
+
+        for meshAnchor in meshAnchors.prefix(maxAnchors) {
+            let sampled = sampleMeshGeometry(
+                meshAnchor.geometry,
+                maxPoints: maxPointsPerAnchor,
+                remainingCapacity: maxTotalPoints - points.count
+            )
+            if sampled.points.isEmpty { continue }
+            points.append(contentsOf: sampled.points)
+            if !sampled.normals.isEmpty {
+                normals.append(contentsOf: sampled.normals)
+            }
+            if points.count >= maxTotalPoints { break }
+        }
+
+        guard !points.isEmpty else { return nil }
+        let descriptor = buildMeshSignatureDescriptor(points: points, normals: normals)
+        return LiveFallbackInput(points: points, descriptor: descriptor)
+    }
+
     static func runICPLiteRefinement(
         hypotheses: [MeshRelocalizationHypothesis],
         frame: ARFrame,
         currentYaw: Float,
-        saved: MeshMapArtifact
+        saved: MeshMapArtifact,
+        savedPoints: [SIMD3<Float>],
+        livePoints: [SIMD3<Float>],
+        liveDescriptor: MeshSignatureDescriptor,
+        savedStructure: StructureSignatureArtifact?,
+        savedVision: VisionIndexArtifact?,
+        visionCandidate: VisionPlaceCandidate?,
+        mode: FallbackLocalizationMode
     ) -> MeshRelocalizationResult? {
-        guard let liveArtifact = extractLiveMeshSnapshot(from: frame) else { return nil }
+        let resolvedSavedPoints = savedPoints.isEmpty ? downsampleSavedMeshPoints(saved, maxPoints: 1200) : savedPoints
+        guard !livePoints.isEmpty, !resolvedSavedPoints.isEmpty else { return nil }
+        let liveStructure = buildStructureSignature(
+            from: MeshMapArtifact(
+                mapName: "live",
+                capturedAt: Date(),
+                meshAnchors: [],
+                descriptor: liveDescriptor,
+                version: 1
+            )
+        )
+        let resolvedVisionCandidate: VisionPlaceCandidate?
+        if let visionCandidate {
+            resolvedVisionCandidate = visionCandidate
+        } else if mode == .hybridGeometryVision, let savedVision {
+            resolvedVisionCandidate = retrieveVisionPlaceCandidate(from: frame, saved: savedVision)
+        } else {
+            resolvedVisionCandidate = nil
+        }
 
-        let livePoints = downsamplePointCloud(flatPointsToSIMD(liveArtifact.meshAnchors.flatMap(\.vertices)), maxPoints: 1200)
-        let savedPoints = downsamplePointCloud(flatPointsToSIMD(saved.meshAnchors.flatMap(\.vertices)), maxPoints: 1200)
-        guard !livePoints.isEmpty, !savedPoints.isEmpty else { return nil }
-
-        let savedCentroid = centroidXZ(savedPoints)
+        let savedCentroid = centroidXZ(resolvedSavedPoints)
         let liveCentroid = centroidXZ(livePoints)
 
         var best: MeshRelocalizationHypothesis?
@@ -90,14 +223,31 @@ enum MeshRelocalizationEngine {
             let yawDelta = angleDistanceDegrees(currentYaw * 180 / .pi, h.yawDegrees)
             let centroidT = savedCentroid - liveCentroid
             let combinedT = (h.translationXZ + centroidT) * 0.5
+            let structureBoost = structureAgreementBoost(
+                hypothesis: h,
+                saved: savedStructure,
+                live: liveStructure
+            )
+            let visionBoost: Float
+            if let resolvedVisionCandidate {
+                let visionYaw = resolvedVisionCandidate.mapFromSessionTransform.forwardYawRadians * 180 / .pi
+                let yawAgreement = max(0, 1 - angleDistanceDegrees(h.yawDegrees, visionYaw) / 180)
+                visionBoost = (resolvedVisionCandidate.confidence * 0.2) + (yawAgreement * 0.1)
+            } else {
+                visionBoost = 0
+            }
             let extentPenalty = min(
                 simd_length(
                     (saved.descriptor.boundsMaxXZ - saved.descriptor.boundsMinXZ) -
-                    (liveArtifact.descriptor.boundsMaxXZ - liveArtifact.descriptor.boundsMinXZ)
+                    (liveDescriptor.boundsMaxXZ - liveDescriptor.boundsMinXZ)
                 ),
                 3
             )
-            let score = h.coarseConfidence - (abs(yawDelta) / 180) * 0.25 - extentPenalty * 0.05
+            let score = h.coarseConfidence
+                + structureBoost
+                + visionBoost
+                - (abs(yawDelta) / 180) * 0.25
+                - extentPenalty * 0.05
             if score > bestScore {
                 bestScore = score
                 best = MeshRelocalizationHypothesis(
@@ -112,9 +262,10 @@ enum MeshRelocalizationEngine {
         guard let refined = best else { return nil }
         let coarse = hypotheses.first
         let confidence = min(max((coarse?.coarseConfidence ?? 0) * 0.4 + refined.coarseConfidence * 0.6, 0), 1)
+        let confidenceBand = fallbackConfidenceBand(for: confidence)
         let orientationHint = normalizedDegrees(refined.yawDegrees - currentYaw * 180 / .pi)
         let areaHint = simd_length(refined.translationXZ) > 1.5 ? "room edge side" : "room center side"
-        let supportCount = min(livePoints.count, savedPoints.count)
+        let supportCount = min(livePoints.count, resolvedSavedPoints.count)
         let residual = min(max(1 - refined.coarseConfidence, 0), 1) * 0.35 + 0.03
         let overlap = min(max(refined.coarseConfidence * 0.75 + 0.15, 0), 1)
         let yawConfidence = max(6, 25 - confidence * 18)
@@ -130,7 +281,9 @@ enum MeshRelocalizationEngine {
             yawConfidenceDegrees: yawConfidence,
             supportingPointCount: supportCount,
             isStableAcrossFrames: false,
-            debugReason: "Coarse descriptor hypotheses + centroid/extent bounded refinement"
+            debugReason: "Hybrid structure/vision-seeded descriptor + centroid/extent bounded refinement",
+            confidenceBand: confidenceBand,
+            visionSeedDistance: resolvedVisionCandidate?.distance
         )
     }
 
@@ -146,6 +299,10 @@ enum MeshRelocalizationEngine {
             }
         }
 
+        return buildMeshSignatureDescriptor(points: points, normals: normals)
+    }
+
+    private static func buildMeshSignatureDescriptor(points: [SIMD3<Float>], normals: [SIMD3<Float>]) -> MeshSignatureDescriptor {
         let dsPoints = downsamplePointCloud(points, maxPoints: 5000)
         let wallNormals = estimateWallLikePlanes(points: dsPoints, normals: normals)
 
@@ -195,13 +352,131 @@ enum MeshRelocalizationEngine {
         return Swift.stride(from: 0, to: points.count, by: step).map { points[$0] }
     }
 
+    private static func estimateFloorY(from artifact: MeshMapArtifact) -> Float {
+        let points = artifact.meshAnchors.flatMap(\.vertices).chunked3SIMD
+        guard !points.isEmpty else { return 0 }
+        let ys = points.map(\.y).sorted()
+        return ys[max(0, Int(Float(ys.count) * 0.05))]
+    }
+
+    private static func estimateStructureSegments(from descriptor: MeshSignatureDescriptor) -> [StructureSegment2D] {
+        guard !descriptor.dominantYawBins.isEmpty else { return [] }
+        let center = (descriptor.boundsMinXZ + descriptor.boundsMaxXZ) * 0.5
+        let radius = simd_length(descriptor.boundsMaxXZ - descriptor.boundsMinXZ) * 0.5
+        let yawStep = 360.0 / Float(descriptor.dominantYawBins.count)
+        return descriptor.dominantYawBins.enumerated().compactMap { idx, weight in
+            guard weight > 0.04 else { return nil }
+            let degrees = Float(idx) * yawStep - 180
+            let rad = degrees * .pi / 180
+            let dir = SIMD2<Float>(cos(rad), sin(rad))
+            let tangent = SIMD2<Float>(-dir.y, dir.x)
+            let p0 = center - tangent * radius * 0.5
+            let p1 = center + tangent * radius * 0.5
+            return StructureSegment2D(start: p0, end: p1, orientationDegrees: degrees, supportWeight: weight)
+        }
+    }
+
+    private static func structureAgreementBoost(
+        hypothesis: MeshRelocalizationHypothesis,
+        saved: StructureSignatureArtifact?,
+        live: StructureSignatureArtifact?
+    ) -> Float {
+        guard let saved, let live else { return 0 }
+        guard !saved.dominantYawBins.isEmpty, !live.dominantYawBins.isEmpty else { return 0 }
+        let count = min(saved.dominantYawBins.count, live.dominantYawBins.count)
+        var corr: Float = 0
+        for i in 0..<count {
+            corr += saved.dominantYawBins[i] * live.dominantYawBins[i]
+        }
+        let shiftedYawDistance = angleDistanceDegrees(hypothesis.yawDegrees, 0)
+        let yawPenalty = (shiftedYawDistance / 180) * 0.05
+        return max(0, min(corr, 1) * 0.12 - yawPenalty)
+    }
+
+    private static func fallbackConfidenceBand(for confidence: Float) -> FallbackConfidenceBand {
+        if confidence >= 0.82 { return .high }
+        if confidence >= 0.65 { return .medium }
+        return .low
+    }
+
+    private static func featurePrintData(from pixelBuffer: CVPixelBuffer) -> Data? {
+        guard let observation = featurePrintObservation(from: pixelBuffer) else { return nil }
+        return try? NSKeyedArchiver.archivedData(withRootObject: observation, requiringSecureCoding: true)
+    }
+
+    private static func featurePrintObservation(from data: Data) -> VNFeaturePrintObservation? {
+        try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: data)
+    }
+
+    private static func featurePrintObservation(from pixelBuffer: CVPixelBuffer) -> VNFeaturePrintObservation? {
+        autoreleasepool {
+            let request = VNGenerateImageFeaturePrintRequest()
+            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+            do {
+                try handler.perform([request])
+                return request.results?.first as? VNFeaturePrintObservation
+            } catch {
+                return nil
+            }
+        }
+    }
+
+    private static func sampleMeshGeometry(
+        _ geometry: ARMeshGeometry,
+        maxPoints: Int,
+        remainingCapacity: Int
+    ) -> (points: [SIMD3<Float>], normals: [SIMD3<Float>]) {
+        let capacity = max(0, min(maxPoints, remainingCapacity))
+        guard capacity > 0 else { return ([], []) }
+
+        let vertexSource = geometry.vertices
+        guard vertexSource.count > 0 else { return ([], []) }
+        let normalSource = geometry.normals
+        let sampleCount = min(vertexSource.count, capacity)
+        let step = max(1, vertexSource.count / sampleCount)
+
+        let vertexPtr = vertexSource.buffer.contents()
+        let normalPtr = normalSource.buffer.contents()
+        let hasNormals = normalSource.count > 0
+
+        var sampledPoints: [SIMD3<Float>] = []
+        sampledPoints.reserveCapacity(sampleCount)
+        var sampledNormals: [SIMD3<Float>] = []
+        sampledNormals.reserveCapacity(sampleCount)
+
+        var idx = 0
+        while idx < vertexSource.count && sampledPoints.count < sampleCount {
+            let vertexOffset = vertexSource.offset + vertexSource.stride * idx
+            let point = vertexPtr.advanced(by: vertexOffset).assumingMemoryBound(to: SIMD3<Float>.self).pointee
+            sampledPoints.append(point)
+
+            if hasNormals {
+                let normalIndex = min(idx, max(0, normalSource.count - 1))
+                let normalOffset = normalSource.offset + normalSource.stride * normalIndex
+                let normal = normalPtr.advanced(by: normalOffset).assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                sampledNormals.append(normal)
+            }
+            idx += step
+        }
+
+        return (sampledPoints, sampledNormals)
+    }
+
     static func estimateWallLikePlanes(points: [SIMD3<Float>], normals: [SIMD3<Float>]) -> [SIMD3<Float>] {
         let _ = points
         guard !normals.isEmpty else {
             // Fallback heuristic if normals unavailable: infer no strong wall normals.
             return []
         }
-        return normals.filter { abs($0.y) < 0.45 }.map { simd_normalize(SIMD3($0.x, 0, $0.z)) }
+        return normals.compactMap { normal in
+            guard abs(normal.y) < 0.45 else { return nil }
+            let flattened = SIMD3<Float>(normal.x, 0, normal.z)
+            let length = simd_length(flattened)
+            guard length > 0.0001, length.isFinite else { return nil }
+            let unit = flattened / length
+            guard unit.x.isFinite, unit.y.isFinite, unit.z.isFinite else { return nil }
+            return unit
+        }
     }
 
     private static func coarseOccupancyHash(

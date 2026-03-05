@@ -246,6 +246,73 @@ struct MeshRelocalizationHypothesis: Codable {
     let source: String
 }
 
+enum FallbackLocalizationMode: String, Codable {
+    case geometryOnly
+    case hybridGeometryVision
+
+    var displayName: String {
+        switch self {
+        case .geometryOnly: return "Geometry Only"
+        case .hybridGeometryVision: return "Hybrid Geometry + Vision"
+        }
+    }
+}
+
+enum FallbackConfidenceBand: String, Codable {
+    case low
+    case medium
+    case high
+
+    var displayName: String {
+        rawValue.capitalized
+    }
+}
+
+enum FallbackDecision: String, Codable {
+    case reject
+    case needsUserConfirmation
+    case accept
+}
+
+struct StructureSegment2D: Codable {
+    let start: SIMD2<Float>
+    let end: SIMD2<Float>
+    let orientationDegrees: Float
+    let supportWeight: Float
+}
+
+struct StructureSignatureArtifact: Codable {
+    let mapName: String
+    let capturedAt: Date
+    let dominantYawBins: [Float]
+    let floorYEstimate: Float
+    let boundsMinXZ: SIMD2<Float>
+    let boundsMaxXZ: SIMD2<Float>
+    let structuralSegments: [StructureSegment2D]
+    let version: Int
+}
+
+struct VisionFeatureRecord: Codable {
+    let id: UUID
+    let capturedAt: Date
+    let mapFromSessionTransform: [Float]
+    let featurePrintData: Data
+}
+
+struct VisionIndexArtifact: Codable {
+    let mapName: String
+    let capturedAt: Date
+    let records: [VisionFeatureRecord]
+    let version: Int
+}
+
+struct VisionPlaceCandidate {
+    let recordID: UUID
+    let mapFromSessionTransform: simd_float4x4
+    let distance: Float
+    let confidence: Float
+}
+
 struct MeshRelocalizationResult {
     let coarsePoseSeed: MeshRelocalizationHypothesis?
     let refinedPoseSeed: MeshRelocalizationHypothesis?
@@ -258,6 +325,38 @@ struct MeshRelocalizationResult {
     let supportingPointCount: Int
     let isStableAcrossFrames: Bool
     let debugReason: String
+    let confidenceBand: FallbackConfidenceBand
+    let visionSeedDistance: Float?
+
+    init(
+        coarsePoseSeed: MeshRelocalizationHypothesis?,
+        refinedPoseSeed: MeshRelocalizationHypothesis?,
+        orientationHintDegrees: Float?,
+        areaHint: String?,
+        confidence: Float,
+        residualErrorMeters: Float,
+        overlapRatio: Float,
+        yawConfidenceDegrees: Float,
+        supportingPointCount: Int,
+        isStableAcrossFrames: Bool,
+        debugReason: String,
+        confidenceBand: FallbackConfidenceBand = .low,
+        visionSeedDistance: Float? = nil
+    ) {
+        self.coarsePoseSeed = coarsePoseSeed
+        self.refinedPoseSeed = refinedPoseSeed
+        self.orientationHintDegrees = orientationHintDegrees
+        self.areaHint = areaHint
+        self.confidence = confidence
+        self.residualErrorMeters = residualErrorMeters
+        self.overlapRatio = overlapRatio
+        self.yawConfidenceDegrees = yawConfidenceDegrees
+        self.supportingPointCount = supportingPointCount
+        self.isStableAcrossFrames = isStableAcrossFrames
+        self.debugReason = debugReason
+        self.confidenceBand = confidenceBand
+        self.visionSeedDistance = visionSeedDistance
+    }
 }
 
 enum MeshFallbackPhase: String {
@@ -321,6 +420,51 @@ enum AppLocalizationSource: String {
         case .arkitWorldMap: return "ARKit WorldMap"
         case .arkitAndMeshConsistent: return "ARKit + Mesh Consistent"
         }
+    }
+}
+
+enum LocalizationEventType: String, Codable {
+    case meshCandidateRejected
+    case meshCandidateStabilizing
+    case meshAccepted
+    case worldOriginShiftApplied
+    case arkitPromoted
+    case conflictDetected
+    case degraded
+    case meshAligningReset
+    case visionCandidateSelected
+    case geometryRegistrationAccepted
+    case confirmationRequested
+    case confirmationAccepted
+    case confirmationRejected
+    case fallbackTimeout
+}
+
+struct LocalizationEventRecord: Codable, Identifiable {
+    let id: UUID
+    let timestamp: Date
+    let eventType: LocalizationEventType
+    let appState: String
+    let arkitState: String
+    let confidence: Float
+    let details: String
+
+    init(
+        id: UUID = UUID(),
+        timestamp: Date = Date(),
+        eventType: LocalizationEventType,
+        appState: String,
+        arkitState: String,
+        confidence: Float,
+        details: String
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.eventType = eventType
+        self.appState = appState
+        self.arkitState = arkitState
+        self.confidence = confidence
+        self.details = details
     }
 }
 
@@ -454,6 +598,18 @@ enum Phase1MapStore {
         bundleDirectory.appendingPathComponent("meshArtifact.json")
     }
 
+    private static var structureSignatureURL: URL {
+        bundleDirectory.appendingPathComponent("structureSignature.json")
+    }
+
+    private static var visionIndexURL: URL {
+        bundleDirectory.appendingPathComponent("visionIndex.json")
+    }
+
+    private static var localizationLogURL: URL {
+        bundleDirectory.appendingPathComponent("localizationEvents.json")
+    }
+
     static func savedMapExists() -> Bool {
         FileManager.default.fileExists(atPath: worldMapURL.path)
     }
@@ -541,6 +697,78 @@ enum Phase1MapStore {
         guard FileManager.default.fileExists(atPath: meshArtifactURL.path) else { return nil }
         let data = try Data(contentsOf: meshArtifactURL)
         return try JSONDecoder.iso8601.decode(MeshMapArtifact.self, from: data)
+    }
+
+    static func saveStructureSignature(_ artifact: StructureSignatureArtifact) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: bundleDirectory, withIntermediateDirectories: true, attributes: nil)
+        let data = try JSONEncoder.pretty.encode(artifact)
+        try data.write(to: structureSignatureURL, options: .atomic)
+    }
+
+    static func loadStructureSignature() throws -> StructureSignatureArtifact? {
+        guard FileManager.default.fileExists(atPath: structureSignatureURL.path) else { return nil }
+        let data = try Data(contentsOf: structureSignatureURL)
+        return try JSONDecoder.iso8601.decode(StructureSignatureArtifact.self, from: data)
+    }
+
+    static func saveVisionIndex(_ artifact: VisionIndexArtifact) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: bundleDirectory, withIntermediateDirectories: true, attributes: nil)
+        let data = try JSONEncoder.pretty.encode(artifact)
+        try data.write(to: visionIndexURL, options: .atomic)
+    }
+
+    static func loadVisionIndex() throws -> VisionIndexArtifact? {
+        guard FileManager.default.fileExists(atPath: visionIndexURL.path) else { return nil }
+        let data = try Data(contentsOf: visionIndexURL)
+        return try JSONDecoder.iso8601.decode(VisionIndexArtifact.self, from: data)
+    }
+
+    static func appendLocalizationEvent(_ event: LocalizationEventRecord) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: bundleDirectory, withIntermediateDirectories: true, attributes: nil)
+        let line = try JSONEncoder.pretty.encode(event)
+        if !fm.fileExists(atPath: localizationLogURL.path) {
+            var payload = line
+            payload.append(0x0A)
+            try payload.write(to: localizationLogURL, options: .atomic)
+            return
+        }
+        let handle = try FileHandle(forWritingTo: localizationLogURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: line)
+        try handle.write(contentsOf: Data([0x0A]))
+    }
+
+    static func loadLocalizationEvents() throws -> [LocalizationEventRecord] {
+        guard FileManager.default.fileExists(atPath: localizationLogURL.path) else { return [] }
+        let data = try Data(contentsOf: localizationLogURL)
+        if data.isEmpty { return [] }
+        // Backward compatible with old JSON-array format and new JSON-lines format.
+        if let first = data.first(where: { !$0.isASCIIWhitespace }) {
+            if first == UInt8(ascii: "[") {
+                return try JSONDecoder.iso8601.decode([LocalizationEventRecord].self, from: data)
+            }
+        }
+
+        var events: [LocalizationEventRecord] = []
+        let decoder = JSONDecoder.iso8601
+        for line in data.split(separator: UInt8(ascii: "\n")) {
+            let trimmed = line.drop(while: { $0.isASCIIWhitespace })
+            guard !trimmed.isEmpty else { continue }
+            if let record = try? decoder.decode(LocalizationEventRecord.self, from: Data(trimmed)) {
+                events.append(record)
+            }
+        }
+        return events
+    }
+}
+
+private extension UInt8 {
+    var isASCIIWhitespace: Bool {
+        self == 0x20 || self == 0x0A || self == 0x0D || self == 0x09
     }
 }
 

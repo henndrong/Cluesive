@@ -41,6 +41,188 @@ final class RelocalizationCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(String(describing: decision), String(describing: RelocalizationCoordinator.ReconciliationDecision.enterConflict))
     }
+
+    func testEvaluateMeshAlignmentCandidateRejectsLowConfidenceBoundary() {
+        let result = MeshRelocalizationResult(
+            coarsePoseSeed: nil,
+            refinedPoseSeed: nil,
+            orientationHintDegrees: nil,
+            areaHint: nil,
+            confidence: 0.79,
+            residualErrorMeters: 0.1,
+            overlapRatio: 0.5,
+            yawConfidenceDegrees: 10,
+            supportingPointCount: 400,
+            isStableAcrossFrames: false,
+            debugReason: "test"
+        )
+
+        XCTAssertFalse(RelocalizationCoordinator.evaluateMeshAlignmentCandidate(result))
+    }
+
+    func testStabilizeMeshAlignmentCandidateRequiresThreeFrames() {
+        let candidate = makeStrongMeshResult(yawDegrees: 90, translation: SIMD2<Float>(0.5, -0.2))
+
+        let first = RelocalizationCoordinator.stabilizeMeshAlignmentCandidate(buffer: [], result: candidate)
+        XCTAssertNil(first.acceptance)
+
+        let second = RelocalizationCoordinator.stabilizeMeshAlignmentCandidate(
+            buffer: first.updatedBuffer,
+            result: candidate
+        )
+        XCTAssertNil(second.acceptance)
+
+        let third = RelocalizationCoordinator.stabilizeMeshAlignmentCandidate(
+            buffer: second.updatedBuffer,
+            result: candidate
+        )
+        XCTAssertNotNil(third.acceptance)
+    }
+
+    func testStabilizeMeshAlignmentCandidateRejectsUnstableSeeds() {
+        let first = makeStrongMeshResult(yawDegrees: 10, translation: SIMD2<Float>(0.1, 0.1))
+        let second = makeStrongMeshResult(yawDegrees: 20, translation: SIMD2<Float>(0.2, 0.2))
+        let unstable = makeStrongMeshResult(yawDegrees: 70, translation: SIMD2<Float>(1.4, 1.3))
+
+        let o1 = RelocalizationCoordinator.stabilizeMeshAlignmentCandidate(buffer: [], result: first)
+        let o2 = RelocalizationCoordinator.stabilizeMeshAlignmentCandidate(buffer: o1.updatedBuffer, result: second)
+        let o3 = RelocalizationCoordinator.stabilizeMeshAlignmentCandidate(buffer: o2.updatedBuffer, result: unstable)
+
+        XCTAssertNil(o3.acceptance)
+        XCTAssertTrue(o3.statusText?.contains("unstable") ?? false)
+    }
+
+    func testAppLocalizationTickPlanResetsMeshAligningAfterInconclusiveFallback() {
+        let plan = RelocalizationCoordinator.appLocalizationTickPlan(
+            localizationState: .relocalizing,
+            loadRequestedAt: Date(),
+            appLocalizationState: .meshAligning,
+            meshOnlyTestModeEnabled: false,
+            meshFallbackActive: true,
+            meshResult: nil,
+            hasAppliedWorldOriginShiftForCurrentAttempt: false,
+            isPoseStableForAnchorActions: true,
+            latestLocalizationConfidence: 0.7,
+            meshFallbackPhase: .inconclusive
+        )
+
+        XCTAssertTrue(plan.shouldResetMeshAligningToSearching)
+        XCTAssertEqual(plan.resetStatusText, "Mesh Override: Rejected (inconclusive)")
+    }
+
+    func testAppLocalizationTickPlanDegradesWhenMeshAlignedButUnstable() {
+        let plan = RelocalizationCoordinator.appLocalizationTickPlan(
+            localizationState: .relocalizing,
+            loadRequestedAt: Date(),
+            appLocalizationState: .meshAlignedOverride,
+            meshOnlyTestModeEnabled: false,
+            meshFallbackActive: false,
+            meshResult: nil,
+            hasAppliedWorldOriginShiftForCurrentAttempt: true,
+            isPoseStableForAnchorActions: false,
+            latestLocalizationConfidence: 0.2,
+            meshFallbackPhase: .matched
+        )
+
+        XCTAssertTrue(plan.shouldDegradeMeshAlignedOverride)
+        XCTAssertEqual(plan.degradeReason, "Pose stability and confidence dropped after mesh alignment")
+    }
+
+    func testReconcileDecisionPromotesWithoutConflict() {
+        let decision = RelocalizationCoordinator.reconcileDecision(
+            appLocalizationState: .meshAlignedOverride,
+            localizationState: .localized,
+            loadRequestedAt: Date(),
+            conflict: nil,
+            conflictDisagreementFrames: 0,
+            latestLocalizationConfidence: 0.5
+        )
+
+        XCTAssertEqual(
+            String(describing: decision),
+            String(describing: RelocalizationCoordinator.ReconciliationDecision.promoteARKitConfirmed)
+        )
+    }
+
+    func testReconcileDecisionTrustsARKitWhenHighConfidenceAndMeshWeak() {
+        let conflict = LocalizationConflictSnapshot(
+            positionDeltaMeters: 1.2,
+            yawDeltaDegrees: 45,
+            arkitStateAtConflict: "localized",
+            meshConfidenceAtConflict: 0.7,
+            detectedAt: Date()
+        )
+
+        let decision = RelocalizationCoordinator.reconcileDecision(
+            appLocalizationState: .meshAlignedOverride,
+            localizationState: .localized,
+            loadRequestedAt: Date(),
+            conflict: conflict,
+            conflictDisagreementFrames: 1,
+            latestLocalizationConfidence: 0.95
+        )
+
+        XCTAssertEqual(
+            String(describing: decision),
+            String(describing: RelocalizationCoordinator.ReconciliationDecision.resetConflictCounterAndPromote)
+        )
+    }
+
+    func testFallbackDecisionRequiresConfirmationForMediumBand() {
+        XCTAssertEqual(
+            RelocalizationCoordinator.fallbackDecision(for: .medium),
+            .needsUserConfirmation
+        )
+    }
+
+    func testFallbackDecisionAcceptsHighBand() {
+        XCTAssertEqual(
+            RelocalizationCoordinator.fallbackDecision(for: .high),
+            .accept
+        )
+    }
+
+    func testAppLocalizationTickPlanDoesNotEnterMeshAligningInMeshOnlyMode() {
+        let plan = RelocalizationCoordinator.appLocalizationTickPlan(
+            localizationState: .relocalizing,
+            loadRequestedAt: Date(),
+            appLocalizationState: .searching,
+            meshOnlyTestModeEnabled: true,
+            meshFallbackActive: true,
+            meshResult: nil,
+            hasAppliedWorldOriginShiftForCurrentAttempt: false,
+            isPoseStableForAnchorActions: true,
+            latestLocalizationConfidence: 0.4,
+            meshFallbackPhase: .coarseMatching
+        )
+
+        XCTAssertEqual(
+            String(describing: plan.startAction),
+            String(describing: RelocalizationCoordinator.AppLocalizationStartAction.none)
+        )
+    }
+
+    private func makeStrongMeshResult(yawDegrees: Float, translation: SIMD2<Float>) -> MeshRelocalizationResult {
+        let seed = MeshRelocalizationHypothesis(
+            yawDegrees: yawDegrees,
+            translationXZ: translation,
+            coarseConfidence: 0.9,
+            source: "test"
+        )
+        return MeshRelocalizationResult(
+            coarsePoseSeed: seed,
+            refinedPoseSeed: seed,
+            orientationHintDegrees: 0,
+            areaHint: "test",
+            confidence: 0.9,
+            residualErrorMeters: 0.1,
+            overlapRatio: 0.5,
+            yawConfidenceDegrees: 8,
+            supportingPointCount: 350,
+            isStableAcrossFrames: true,
+            debugReason: "test"
+        )
+    }
 }
 
 final class RelocalizationAttemptCoordinatorTests: XCTestCase {
@@ -158,5 +340,31 @@ final class AppLocalizationPresentationCoordinatorTests: XCTestCase {
         XCTAssertTrue(presentation.appLocalizationConfidenceText.contains("86%"))
         XCTAssertTrue(presentation.meshOverrideAppliedText.contains("Yes"))
         XCTAssertTrue(presentation.appLocalizationPromptText.contains("provisional"))
+    }
+}
+
+final class AnchorManagerDualLocalizationTests: XCTestCase {
+    func testAnchorPlacementBlockedDuringConflict() {
+        let eligibility = AnchorManager.validateAnchorPlacementEligibility(
+            currentPoseTransform: matrix_identity_float4x4,
+            appLocalizationState: .conflict,
+            isPoseStableForAnchorActions: true,
+            effectiveConfidence: 0.9,
+            requiredConfidence: 0.7
+        )
+
+        XCTAssertFalse(eligibility.allowed)
+    }
+
+    func testAnchorPlacementBlockedDuringDegraded() {
+        let eligibility = AnchorManager.validateAnchorPlacementEligibility(
+            currentPoseTransform: matrix_identity_float4x4,
+            appLocalizationState: .degraded,
+            isPoseStableForAnchorActions: true,
+            effectiveConfidence: 0.9,
+            requiredConfidence: 0.7
+        )
+
+        XCTAssertFalse(eligibility.allowed)
     }
 }

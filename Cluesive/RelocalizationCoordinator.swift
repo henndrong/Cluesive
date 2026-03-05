@@ -161,8 +161,10 @@ enum RelocalizationCoordinator {
         localizationState: LocalizationState,
         loadRequestedAt: Date?,
         meshFallbackActive: Bool,
-        appLocalizationState: AppLocalizationState
+        appLocalizationState: AppLocalizationState,
+        meshOnlyTestModeEnabled: Bool
     ) -> Bool {
+        guard !meshOnlyTestModeEnabled else { return false }
         let arkitLocalizedAfterLoad = localizationState == .localized && loadRequestedAt != nil
         guard !arkitLocalizedAfterLoad else { return false }
         return meshFallbackActive && appLocalizationState == .searching
@@ -172,7 +174,8 @@ enum RelocalizationCoordinator {
         localizationState: LocalizationState,
         loadRequestedAt: Date?,
         appLocalizationState: AppLocalizationState,
-        meshFallbackActive: Bool
+        meshFallbackActive: Bool,
+        meshOnlyTestModeEnabled: Bool
     ) -> AppLocalizationStartAction {
         if localizationState == .localized, loadRequestedAt != nil {
             if appLocalizationState == .meshAlignedOverride {
@@ -188,7 +191,8 @@ enum RelocalizationCoordinator {
             localizationState: localizationState,
             loadRequestedAt: loadRequestedAt,
             meshFallbackActive: meshFallbackActive,
-            appLocalizationState: appLocalizationState
+            appLocalizationState: appLocalizationState,
+            meshOnlyTestModeEnabled: meshOnlyTestModeEnabled
         ) {
             return .enterMeshAligning
         }
@@ -200,6 +204,7 @@ enum RelocalizationCoordinator {
         localizationState: LocalizationState,
         loadRequestedAt: Date?,
         appLocalizationState: AppLocalizationState,
+        meshOnlyTestModeEnabled: Bool,
         meshFallbackActive: Bool,
         meshResult: MeshRelocalizationResult?,
         hasAppliedWorldOriginShiftForCurrentAttempt: Bool,
@@ -211,7 +216,8 @@ enum RelocalizationCoordinator {
             localizationState: localizationState,
             loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
-            meshFallbackActive: meshFallbackActive
+            meshFallbackActive: meshFallbackActive,
+            meshOnlyTestModeEnabled: meshOnlyTestModeEnabled
         )
 
         let shouldAttemptAcceptance = shouldAttemptMeshAcceptance(
@@ -264,6 +270,18 @@ enum RelocalizationCoordinator {
             acceptance.residualErrorMeters,
             acceptance.overlapRatio * 100
         )
+    }
+
+    static func fallbackDecision(for band: FallbackConfidenceBand) -> FallbackDecision {
+        switch band {
+        case .high: return .accept
+        case .medium: return .needsUserConfirmation
+        case .low: return .reject
+        }
+    }
+
+    static func fallbackTimeoutSeconds() -> TimeInterval {
+        5.0
     }
 
     static func shouldDegradeMeshAlignedOverride(

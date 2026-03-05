@@ -9,6 +9,7 @@ import SwiftUI
 import Combine
 import ARKit
 import SceneKit
+import UIKit
 
 @MainActor
 final class RoomPlanModel: NSObject, ObservableObject {
@@ -65,6 +66,11 @@ final class RoomPlanModel: NSObject, ObservableObject {
     @Published var meshFallbackPhaseText = "Mesh Fallback Phase: idle"
     @Published var meshFallbackConfidenceText = "Mesh Fallback Confidence: 0%"
     @Published var meshFallbackPromptText: String?
+    @Published var fallbackModeText = "Fallback mode: Hybrid Geometry + Vision"
+    @Published var fallbackConfidenceBandText = "Fallback confidence band: Low"
+    @Published var fallbackNeedsConfirmation = false
+    @Published var fallbackConfirmationPromptText: String?
+    @Published var fallbackLatencyMsText = "Fallback latency: n/a"
     @Published var meshArtifactStatusText = "Mesh Artifact: Not captured"
     @Published var meshArtifactCaptureWarningText: String?
     @Published var meshPoseSeedText = "Mesh Pose Seed: n/a"
@@ -77,6 +83,24 @@ final class RoomPlanModel: NSObject, ObservableObject {
     @Published var localizationConflictText: String?
     @Published var meshOverrideStatusText = "Mesh Override: Awaiting stable mesh alignment"
     @Published var worldOriginShiftDebugText = "World Origin Shift Debug: n/a"
+    @Published var localizationEventCountText = "Localization Events: 0"
+    @Published var localizationLastEventText = "Last Localization Event: n/a"
+    @Published var meshOnlyTestModeEnabled = false {
+        didSet {
+            if meshOnlyTestModeEnabled {
+                resetAppLocalizationStateForNewAttempt()
+                resetMeshFallbackState()
+                if relocalizationAttemptState == nil {
+                    beginRelocalizationAttempt()
+                }
+                relocalizationText = "Mesh-only test mode active: ARKit relocalization is ignored for app localization."
+                statusMessage = "Mesh-only test mode ON (fallback isolation active)"
+            } else {
+                statusMessage = "Mesh-only test mode OFF"
+            }
+            refreshAppLocalizationUI()
+        }
+    }
 
     fileprivate weak var sceneView: ARSCNView?
 
@@ -121,6 +145,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
     private let roomSignatureProvider: RoomSignatureProvider = StubRoomSignatureProvider()
     private var savedRoomSignatureArtifact: RoomSignatureArtifact?
     private var savedMeshArtifact: MeshMapArtifact?
+    private var savedStructureSignatureArtifact: StructureSignatureArtifact?
+    private var savedVisionIndexArtifact: VisionIndexArtifact?
     private var meshFallbackState = MeshFallbackState(
         active: false,
         phase: .idle,
@@ -137,15 +163,45 @@ final class RoomPlanModel: NSObject, ObservableObject {
     private var postShiftValidationFrames = 0
     private var lastConflictSnapshot: LocalizationConflictSnapshot?
     private var conflictDisagreementFrames = 0
+    private var localizationEvents: [LocalizationEventRecord] = []
+    private var lastLocalizationEventPresentationUpdateAt: Date = .distantPast
+    private var meshFallbackLastEvaluationAt: Date = .distantPast
+    private var meshFallbackEvaluationIntervalSeconds: TimeInterval = 0.75
+    private var visionCandidateEvaluationIntervalSeconds: TimeInterval = 2.0
+    private var lastVisionCandidateEvaluationAt: Date = .distantPast
+    private var memoryPressureRelaxedUntil: Date = .distantPast
+    private var meshFallbackSoftTimeoutLogged = false
+    private var fallbackLocalizationMode: FallbackLocalizationMode = .hybridGeometryVision
+    private var pendingFallbackAcceptance: MeshAlignmentAcceptance?
+    private var hasUserConfirmedMediumFallback = false
+    private var cachedSavedMeshPoints: [SIMD3<Float>] = []
+    private var memoryWarningObserver: NSObjectProtocol?
 
     override init() {
         super.init()
+        fallbackModeText = "Fallback mode: \(fallbackLocalizationMode.displayName)"
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleMemoryWarning()
+            }
+        }
         resetAppLocalizationStateForNewAttempt()
         refreshSavedMapState()
         loadAnchorsFromDisk()
         refreshRoomSignatureStatus()
         refreshMeshArtifactStatus()
+        refreshLocalizationEventLogStatus()
         refreshAnchorActionAvailability()
+    }
+
+    deinit {
+        if let memoryWarningObserver {
+            NotificationCenter.default.removeObserver(memoryWarningObserver)
+        }
     }
 
     func attachSceneView(_ view: ARSCNView) {
@@ -158,6 +214,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         refreshSavedMapState()
         refreshRoomSignatureStatus()
         refreshMeshArtifactStatus()
+        refreshLocalizationEventLogStatus()
     }
 
     func startFreshScan() {
@@ -172,6 +229,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         errorMessage = nil
         awaitingRelocalization = false
         loadRequestedAt = nil
+        clearRuntimeFallbackCaches(keepSavedMeshCache: false)
         resetAppLocalizationStateForNewAttempt()
     }
 
@@ -207,6 +265,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
                     let metadata = try Phase1MapStore.save(worldMap: worldMap)
                     self.captureRoomSignatureIfAvailable()
                     self.captureMeshArtifactIfAvailable(from: frameForMeshCapture)
+                    self.captureStructureSignatureIfAvailable(from: frameForMeshCapture)
+                    self.captureVisionIndexIfAvailable(from: frameForMeshCapture)
                     self.hasSavedMap = true
                     self.lastSavedText = "Saved \(metadata.updatedAt.formatted(date: .abbreviated, time: .shortened))"
                     self.loadAnchorsFromDisk()
@@ -232,6 +292,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
             loadAnchorsFromDisk()
             savedRoomSignatureArtifact = try Phase1MapStore.loadRoomSignature()
             savedMeshArtifact = try Phase1MapStore.loadMeshArtifact()
+            savedStructureSignatureArtifact = try Phase1MapStore.loadStructureSignature()
+            savedVisionIndexArtifact = try Phase1MapStore.loadVisionIndex()
             refreshRoomSignatureStatus()
             refreshMeshArtifactStatus()
             awaitingRelocalization = true
@@ -239,11 +301,16 @@ final class RoomPlanModel: NSObject, ObservableObject {
             stableNormalFramesAfterLoad = 0
             loadRequestedAt = Date()
             localizationState = .relocalizing
-            relocalizationText = "Loaded map. Walk to the same area to relocalize..."
-            statusMessage = "Map loaded, relocalization running"
+            relocalizationText = meshOnlyTestModeEnabled
+                ? "Mesh-only isolation active. ARWorldMap relocalization disabled; scanning fallback artifacts."
+                : "Loaded map. Walk to the same area to relocalize..."
+            statusMessage = meshOnlyTestModeEnabled
+                ? "Map loaded, fallback isolation running (ARKit relocalization disabled)"
+                : "Map loaded, relocalization running"
             errorMessage = nil
             resetAppLocalizationStateForNewAttempt()
-            runSession(initialWorldMap: worldMap)
+            runSession(initialWorldMap: meshOnlyTestModeEnabled ? nil : worldMap)
+            refreshCachedSavedMeshPoints()
             beginRelocalizationAttempt()
         } catch {
             errorMessage = "Load failed: \(error.localizedDescription)"
@@ -306,6 +373,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         do {
             try Phase1MapStore.saveMeshArtifact(artifact)
             savedMeshArtifact = artifact
+            refreshCachedSavedMeshPoints()
             meshArtifactCaptureWarningText = nil
             meshArtifactStatusText = "Mesh Artifact: Available (\(artifact.meshAnchors.count) anchors)"
         } catch {
@@ -314,9 +382,34 @@ final class RoomPlanModel: NSObject, ObservableObject {
         }
     }
 
+    func captureStructureSignatureIfAvailable(from frame: ARFrame?) {
+        guard let frame else { return }
+        guard let artifact = MeshRelocalizationEngine.buildStructureSignature(from: frame) else { return }
+        do {
+            try Phase1MapStore.saveStructureSignature(artifact)
+            savedStructureSignatureArtifact = artifact
+        } catch {
+            meshArtifactCaptureWarningText = "Structure signature save failed: \(error.localizedDescription)"
+        }
+    }
+
+    func captureVisionIndexIfAvailable(from frame: ARFrame?) {
+        guard let frame else { return }
+        guard let artifact = MeshRelocalizationEngine.buildVisionIndex(from: frame) else { return }
+        do {
+            try Phase1MapStore.saveVisionIndex(artifact)
+            savedVisionIndexArtifact = artifact
+        } catch {
+            meshArtifactCaptureWarningText = "Vision index save failed: \(error.localizedDescription)"
+        }
+    }
+
     func refreshMeshArtifactStatus() {
         do {
             savedMeshArtifact = try Phase1MapStore.loadMeshArtifact()
+            savedStructureSignatureArtifact = try Phase1MapStore.loadStructureSignature()
+            savedVisionIndexArtifact = try Phase1MapStore.loadVisionIndex()
+            refreshCachedSavedMeshPoints()
             if let artifact = savedMeshArtifact {
                 meshArtifactStatusText = "Mesh Artifact: Available (\(artifact.meshAnchors.count) anchors)"
             } else {
@@ -326,6 +419,14 @@ final class RoomPlanModel: NSObject, ObservableObject {
             meshArtifactStatusText = "Mesh Artifact: Unreadable"
             meshArtifactCaptureWarningText = "Mesh artifact load failed: \(error.localizedDescription)"
         }
+    }
+
+    func refreshCachedSavedMeshPoints() {
+        guard let saved = savedMeshArtifact else {
+            cachedSavedMeshPoints.removeAll()
+            return
+        }
+        cachedSavedMeshPoints = MeshRelocalizationEngine.downsampleSavedMeshPoints(saved, maxPoints: 1200)
     }
 
     func resetAppLocalizationStateForNewAttempt() {
@@ -342,10 +443,19 @@ final class RoomPlanModel: NSObject, ObservableObject {
         meshOverrideStatusText = "Mesh Override: Awaiting stable mesh alignment"
         meshOverrideAppliedText = "World Origin Shift: No"
         worldOriginShiftDebugText = "World Origin Shift Debug: n/a"
+        fallbackNeedsConfirmation = false
+        fallbackConfirmationPromptText = nil
+        fallbackConfidenceBandText = "Fallback confidence band: Low"
+        fallbackLatencyMsText = "Fallback latency: n/a"
+        pendingFallbackAcceptance = nil
+        hasUserConfirmedMediumFallback = false
         refreshAppLocalizationUI()
     }
 
     func refreshAppLocalizationUI() {
+        let arkitStateForPresentation = meshOnlyTestModeEnabled
+            ? "Suppressed (mesh-only test)"
+            : localizationState.displayText
         let presentation = AppLocalizationPresentationCoordinator.presentation(
             inputs: .init(
                 appLocalizationState: appLocalizationState,
@@ -353,7 +463,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
                 acceptedMeshAlignmentConfidence: acceptedMeshAlignment?.confidence,
                 meshFallbackResultConfidence: meshFallbackState.result?.confidence,
                 latestLocalizationConfidence: latestLocalizationConfidence,
-                arkitLocalizationStateText: localizationState.displayText,
+                arkitLocalizationStateText: arkitStateForPresentation,
                 hasAppliedWorldOriginShift: hasAppliedWorldOriginShiftForCurrentAttempt
             )
         )
@@ -422,7 +532,13 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func updateRelocalizationAttemptMetrics(with frame: ARFrame, currentTransform: simd_float4x4, currentYaw: Float) {
-        guard awaitingRelocalization || localizationState == .relocalizing else { return }
+        let shouldRunAttemptLoop = awaitingRelocalization
+            || localizationState == .relocalizing
+            || (meshOnlyTestModeEnabled && appLocalizationState == .searching)
+        guard shouldRunAttemptLoop else { return }
+        if relocalizationAttemptState == nil {
+            beginRelocalizationAttempt()
+        }
         guard var state = relocalizationAttemptState else { return }
         let _ = currentTransform
         let recent = recentFeaturePointSamples.suffix(60)
@@ -486,9 +602,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func shouldEscalateFromStationaryToMicroMovement() -> Bool {
-        RelocalizationAttemptCoordinator.shouldEscalateToMicroMovement(
+        let decisionLocalizationState: LocalizationState = meshOnlyTestModeEnabled ? .relocalizing : localizationState
+        return RelocalizationAttemptCoordinator.shouldEscalateToMicroMovement(
             state: relocalizationAttemptState,
-            localizationState: localizationState
+            localizationState: decisionLocalizationState
         )
     }
 
@@ -511,11 +628,25 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func shouldTriggerMeshFallback() -> Bool {
-        RelocalizationAttemptCoordinator.shouldTriggerMeshFallback(
+        if meshOnlyTestModeEnabled,
+           appLocalizationState == .searching,
+           !meshFallbackState.active,
+           let state = relocalizationAttemptState
+        {
+            // Debug-mode fast path: allow fallback activation without waiting for
+            // full stationary->micro-movement escalation when ARKit is already localized.
+            let elapsed = Date().timeIntervalSince(state.startedAt)
+            if elapsed >= 2 {
+                return true
+            }
+        }
+
+        let decisionLocalizationState: LocalizationState = meshOnlyTestModeEnabled ? .relocalizing : localizationState
+        return RelocalizationAttemptCoordinator.shouldTriggerMeshFallback(
             hasSavedMeshArtifact: savedMeshArtifact != nil,
             state: relocalizationAttemptState,
             meshFallbackActive: meshFallbackState.active,
-            localizationState: localizationState
+            localizationState: decisionLocalizationState
         )
     }
 
@@ -538,7 +669,17 @@ final class RoomPlanModel: NSObject, ObservableObject {
         meshFallbackConfidenceText = "Mesh Fallback Confidence: 0%"
         meshFallbackPromptText = "Mesh fallback active: hold position if safe and rotate slowly to expose walls and furniture geometry."
         meshPoseSeedText = "Mesh Pose Seed: n/a"
-        if appLocalizationState == .searching {
+        fallbackModeText = "Fallback mode: \(fallbackLocalizationMode.displayName)"
+        fallbackConfidenceBandText = "Fallback confidence band: Low"
+        fallbackLatencyMsText = "Fallback latency: 0 ms"
+        fallbackNeedsConfirmation = false
+        fallbackConfirmationPromptText = nil
+        pendingFallbackAcceptance = nil
+        hasUserConfirmedMediumFallback = false
+        meshFallbackLastEvaluationAt = .distantPast
+        lastVisionCandidateEvaluationAt = .distantPast
+        meshFallbackSoftTimeoutLogged = false
+        if appLocalizationState == .searching && !meshOnlyTestModeEnabled {
             appLocalizationState = .meshAligning
             refreshAppLocalizationUI()
         }
@@ -547,55 +688,102 @@ final class RoomPlanModel: NSObject, ObservableObject {
     func updateMeshFallbackProgress(with frame: ARFrame, currentYaw: Float) {
         guard meshFallbackState.active else { return }
         let elapsed = Date().timeIntervalSince(meshFallbackState.startedAt)
+        fallbackLatencyMsText = "Fallback latency: \(Int((elapsed * 1000).rounded())) ms"
+        if elapsed > RelocalizationCoordinator.fallbackTimeoutSeconds(), !meshFallbackSoftTimeoutLogged {
+            meshFallbackSoftTimeoutLogged = true
+            recordLocalizationEvent(
+                .fallbackTimeout,
+                details: "Fallback has not found a usable candidate yet; continuing scan"
+            )
+        }
 
-        switch meshFallbackState.phase {
-        case .coarseMatching:
-            meshFallbackState.progressText = String(format: "Coarse matching (%.1fs)", elapsed)
-            meshFallbackPhaseText = "Mesh Fallback Phase: coarseMatching"
-            let hypotheses = runCoarseMeshSignatureMatch(from: frame)
-            if hypotheses.isEmpty {
-                if elapsed > 2.0 {
-                    meshFallbackState.phase = .inconclusive
-                    meshFallbackText = "Mesh Fallback: Inconclusive"
-                    meshFallbackPromptText = "Mesh fallback could not find a reliable geometry match. Move toward a wall/corner and retry."
-                }
-                return
+        let now = Date()
+        // Keep fallback active while searching/meshAligning and re-evaluate on rolling frames.
+        let evaluationInterval = now < memoryPressureRelaxedUntil ? max(meshFallbackEvaluationIntervalSeconds, 1.25) : meshFallbackEvaluationIntervalSeconds
+        if now.timeIntervalSince(meshFallbackLastEvaluationAt) < evaluationInterval { return }
+        meshFallbackLastEvaluationAt = now
+
+        guard let liveFallbackInput = MeshRelocalizationEngine.buildLiveFallbackInput(from: frame) else {
+            meshFallbackText = "Mesh Fallback: Searching"
+            meshFallbackPromptText = "No live mesh sample yet. Keep scanning stable walls/corners slowly."
+            return
+        }
+
+        meshFallbackState.phase = .coarseMatching
+        meshFallbackState.progressText = String(format: "Coarse matching (%.1fs)", elapsed)
+        meshFallbackPhaseText = "Mesh Fallback Phase: coarseMatching"
+        let hypotheses = runCoarseMeshSignatureMatch(liveDescriptor: liveFallbackInput.descriptor)
+        if hypotheses.isEmpty {
+            meshFallbackText = "Mesh Fallback: Searching"
+            meshFallbackPromptText = "No strong geometry candidate yet. Keep scanning stable walls/corners slowly."
+            return
+        }
+        var visionCandidate: VisionPlaceCandidate?
+        if let vision = savedVisionIndexArtifact,
+           now.timeIntervalSince(lastVisionCandidateEvaluationAt) >= visionCandidateEvaluationIntervalSeconds
+        {
+            lastVisionCandidateEvaluationAt = now
+            if let candidate = MeshRelocalizationEngine.retrieveVisionPlaceCandidate(from: frame, saved: vision) {
+                visionCandidate = candidate
+                recordLocalizationEvent(
+                    .visionCandidateSelected,
+                    confidence: candidate.confidence,
+                    details: String(format: "Vision prior selected (distance %.3f)", candidate.distance)
+                )
             }
-            meshFallbackState.phase = .refiningICP
-            meshFallbackPhaseText = "Mesh Fallback Phase: refiningICP"
-            if let result = runICPLiteRefinement(hypotheses: hypotheses, frame: frame, currentYaw: currentYaw) {
-                applyMeshFallbackGuidance(result)
-            } else {
-                meshFallbackState.phase = .inconclusive
-                meshFallbackText = "Mesh Fallback: Inconclusive"
-                meshFallbackPromptText = "Mesh refinement was inconclusive. Try a slower sweep near a wall or large furniture."
-            }
-        case .refiningICP, .matched, .inconclusive, .idle:
-            break
+        }
+        meshFallbackState.phase = .refiningICP
+        meshFallbackPhaseText = "Mesh Fallback Phase: refiningICP"
+        if let result = runICPLiteRefinement(
+            hypotheses: hypotheses,
+            frame: frame,
+            currentYaw: currentYaw,
+            liveFallbackInput: liveFallbackInput,
+            visionCandidate: visionCandidate
+        ) {
+            applyMeshFallbackGuidance(result)
+        } else {
+            meshFallbackState.phase = .coarseMatching
+            meshFallbackText = "Mesh Fallback: Searching"
+            meshFallbackPromptText = "Refinement was inconclusive. Continue scanning walls/corners for more structure."
         }
     }
 
-    func runCoarseMeshSignatureMatch(from frame: ARFrame) -> [MeshRelocalizationHypothesis] {
+    func runCoarseMeshSignatureMatch(liveDescriptor: MeshSignatureDescriptor) -> [MeshRelocalizationHypothesis] {
         guard let saved = savedMeshArtifact else { return [] }
-        return MeshRelocalizationEngine.runCoarseMeshSignatureMatch(from: frame, saved: saved)
+        return MeshRelocalizationEngine.runCoarseMeshSignatureMatch(liveDescriptor: liveDescriptor, saved: saved)
     }
 
-    func runICPLiteRefinement(hypotheses: [MeshRelocalizationHypothesis], frame: ARFrame, currentYaw: Float) -> MeshRelocalizationResult? {
+    func runICPLiteRefinement(
+        hypotheses: [MeshRelocalizationHypothesis],
+        frame: ARFrame,
+        currentYaw: Float,
+        liveFallbackInput: MeshRelocalizationEngine.LiveFallbackInput,
+        visionCandidate: VisionPlaceCandidate?
+    ) -> MeshRelocalizationResult? {
         guard let saved = savedMeshArtifact else { return nil }
         return MeshRelocalizationEngine.runICPLiteRefinement(
             hypotheses: hypotheses,
             frame: frame,
             currentYaw: currentYaw,
-            saved: saved
+            saved: saved,
+            savedPoints: cachedSavedMeshPoints,
+            livePoints: liveFallbackInput.points,
+            liveDescriptor: liveFallbackInput.descriptor,
+            savedStructure: savedStructureSignatureArtifact,
+            savedVision: savedVisionIndexArtifact,
+            visionCandidate: visionCandidate,
+            mode: fallbackLocalizationMode
         )
     }
 
     func applyMeshFallbackGuidance(_ result: MeshRelocalizationResult) {
         meshFallbackState.result = result
-        meshFallbackState.phase = result.confidence >= 0.55 ? .matched : .inconclusive
-        meshFallbackText = result.confidence >= 0.55 ? "Mesh Fallback: Matched" : "Mesh Fallback: Low-confidence"
+        meshFallbackState.phase = result.confidence >= 0.55 ? .matched : .coarseMatching
+        meshFallbackText = result.confidence >= 0.55 ? "Mesh Fallback: Matched" : "Mesh Fallback: Searching"
         meshFallbackPhaseText = "Mesh Fallback Phase: \(meshFallbackState.phase.rawValue)"
         meshFallbackConfidenceText = "Mesh Fallback Confidence: \(Int((result.confidence * 100).rounded()))%"
+        fallbackConfidenceBandText = "Fallback confidence band: \(result.confidenceBand.displayName)"
         meshOverrideStatusText = String(
             format: "Mesh Override: candidate conf %.0f%% residual %.2fm overlap %.0f%% yaw±%.0f° pts %d",
             result.confidence * 100,
@@ -619,7 +807,29 @@ final class RoomPlanModel: NSObject, ObservableObject {
         let direction = orient < 0 ? "left" : "right"
         let angle = abs(orient)
         if result.confidence >= 0.55 {
-            meshFallbackPromptText = "Mesh geometry suggests you are near the \(result.areaHint ?? "saved room area"). Turn \(direction) about \(angle)° and hold steady to help ARKit relocalize."
+            switch RelocalizationCoordinator.fallbackDecision(for: result.confidenceBand) {
+            case .accept:
+                meshFallbackPromptText = "Mesh geometry suggests you are near the \(result.areaHint ?? "saved room area"). Turn \(direction) about \(angle)° and hold steady."
+                recordLocalizationEvent(
+                    .geometryRegistrationAccepted,
+                    confidence: result.confidence,
+                    details: "High-confidence geometry registration"
+                )
+            case .needsUserConfirmation:
+                let firstRequest = !fallbackNeedsConfirmation
+                fallbackNeedsConfirmation = true
+                fallbackConfirmationPromptText = "Provisional alignment found. Confirm to proceed cautiously."
+                meshFallbackPromptText = "Provisional alignment found near \(result.areaHint ?? "saved room area"). Confirm before enabling anchor/navigation actions."
+                if firstRequest {
+                    recordLocalizationEvent(
+                        .confirmationRequested,
+                        confidence: result.confidence,
+                        details: "Medium-confidence fallback requires confirmation"
+                    )
+                }
+            case .reject:
+                meshFallbackPromptText = "Geometry match is too weak. Move closer to stable walls/corners and retry."
+            }
         } else {
             meshFallbackPromptText = "Mesh geometry hint is weak. Move closer to a wall/corner and do a slow sweep, then retry relocalization."
         }
@@ -640,13 +850,80 @@ final class RoomPlanModel: NSObject, ObservableObject {
         meshFallbackPromptText = nil
         meshPoseSeedText = "Mesh Pose Seed: n/a"
         meshAlignmentCandidateBuffer.removeAll()
+        fallbackNeedsConfirmation = false
+        fallbackConfirmationPromptText = nil
+        pendingFallbackAcceptance = nil
+        hasUserConfirmedMediumFallback = false
+        lastVisionCandidateEvaluationAt = .distantPast
+        fallbackConfidenceBandText = "Fallback confidence band: Low"
+        fallbackLatencyMsText = "Fallback latency: n/a"
+    }
+
+    func startFallbackIsolationNow() {
+        guard meshOnlyTestModeEnabled else {
+            statusMessage = "Enable fallback-isolation test mode first."
+            return
+        }
+        refreshMeshArtifactStatus()
+        guard savedMeshArtifact != nil else {
+            meshFallbackText = "Mesh Fallback: Unavailable"
+            meshFallbackPromptText = "Cannot start fallback: no saved mesh artifact. Save a new map with mesh artifact first."
+            statusMessage = "Fallback start failed: no saved mesh artifact"
+            refreshAppLocalizationUI()
+            return
+        }
+        if relocalizationAttemptState == nil {
+            beginRelocalizationAttempt()
+        }
+        if !meshFallbackState.active {
+            beginMeshFallbackRelocalization()
+        }
+        appLocalizationState = meshOnlyTestModeEnabled ? .searching : .meshAligning
+        guidanceText = "Fallback forced on. Rotate slowly 180-360° and target stable walls/corners/openings."
+        statusMessage = "Fallback isolation: manual start triggered"
+        refreshAppLocalizationUI()
+    }
+
+    func confirmFallbackAlignment() {
+        hasUserConfirmedMediumFallback = true
+        fallbackNeedsConfirmation = false
+        fallbackConfirmationPromptText = nil
+        recordLocalizationEvent(
+            .confirmationAccepted,
+            confidence: meshFallbackState.result?.confidence,
+            details: "User accepted provisional fallback alignment"
+        )
+        if let acceptance = pendingFallbackAcceptance {
+            pendingFallbackAcceptance = nil
+            promoteToMeshAlignedOverride(using: acceptance)
+        }
+    }
+
+    func rejectFallbackAlignment() {
+        hasUserConfirmedMediumFallback = false
+        fallbackNeedsConfirmation = false
+        fallbackConfirmationPromptText = nil
+        pendingFallbackAcceptance = nil
+        meshFallbackState.phase = .inconclusive
+        meshFallbackText = "Mesh Fallback: Confirmation rejected"
+        appLocalizationState = .searching
+        guidanceText = "Fallback alignment rejected. Rescan stable walls/corners."
+        recordLocalizationEvent(
+            .confirmationRejected,
+            confidence: meshFallbackState.result?.confidence,
+            details: "User rejected provisional fallback alignment"
+        )
+        refreshAppLocalizationUI()
     }
 
     func updateAppLocalizationState(with frame: ARFrame, currentYaw: Float) {
+        let appDecisionLocalizationState: LocalizationState = meshOnlyTestModeEnabled ? .relocalizing : localizationState
+
         var tickPlan = RelocalizationCoordinator.appLocalizationTickPlan(
-            localizationState: localizationState,
+            localizationState: appDecisionLocalizationState,
             loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
+            meshOnlyTestModeEnabled: meshOnlyTestModeEnabled,
             meshFallbackActive: meshFallbackState.active,
             meshResult: meshFallbackState.result,
             hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt,
@@ -659,18 +936,32 @@ final class RoomPlanModel: NSObject, ObservableObject {
         case .none:
             break
         case .reconcileMeshOverride:
-            reconcileARKitRelocalizationAgainstMeshOverride(with: frame)
+            if !meshOnlyTestModeEnabled {
+                reconcileARKitRelocalizationAgainstMeshOverride(with: frame)
+            }
         case .promoteARKitConfirmed:
-            promoteToARKitConfirmed()
+            if !meshOnlyTestModeEnabled {
+                promoteToARKitConfirmed()
+            }
         case .enterMeshAligning:
-            appLocalizationState = .meshAligning
+            if meshOnlyTestModeEnabled {
+                appLocalizationState = .searching
+            } else {
+                appLocalizationState = meshFallbackState.active ? .meshAligning : .searching
+            }
+        }
+
+        if appLocalizationState == .meshAligning && !meshFallbackState.active {
+            appLocalizationState = .searching
+            meshOverrideStatusText = "Mesh Override: Awaiting stable mesh alignment"
         }
 
         // Recompute after potential state transitions above.
         tickPlan = RelocalizationCoordinator.appLocalizationTickPlan(
-            localizationState: localizationState,
+            localizationState: appDecisionLocalizationState,
             loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
+            meshOnlyTestModeEnabled: meshOnlyTestModeEnabled,
             meshFallbackActive: meshFallbackState.active,
             meshResult: meshFallbackState.result,
             hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt,
@@ -684,14 +975,30 @@ final class RoomPlanModel: NSObject, ObservableObject {
         {
             if let acceptance = stabilizeMeshAlignmentCandidate(result) {
                 meshOverrideStatusText = RelocalizationCoordinator.acceptedMeshOverrideStatusText(acceptance)
-                promoteToMeshAlignedOverride(using: acceptance)
+                let decision = RelocalizationCoordinator.fallbackDecision(for: result.confidenceBand)
+                switch decision {
+                case .accept:
+                    promoteToMeshAlignedOverride(using: acceptance)
+                case .needsUserConfirmation:
+                    if hasUserConfirmedMediumFallback {
+                        promoteToMeshAlignedOverride(using: acceptance)
+                    } else {
+                        pendingFallbackAcceptance = acceptance
+                        fallbackNeedsConfirmation = true
+                        fallbackConfirmationPromptText = "Provisional alignment found. Confirm to proceed cautiously."
+                        guidanceText = fallbackConfirmationPromptText ?? guidanceText
+                    }
+                case .reject:
+                    meshOverrideStatusText = "Mesh Override: Candidate rejected (low confidence band)"
+                }
             }
         }
 
         tickPlan = RelocalizationCoordinator.appLocalizationTickPlan(
-            localizationState: localizationState,
+            localizationState: appDecisionLocalizationState,
             loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
+            meshOnlyTestModeEnabled: meshOnlyTestModeEnabled,
             meshFallbackActive: meshFallbackState.active,
             meshResult: meshFallbackState.result,
             hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt,
@@ -703,14 +1010,15 @@ final class RoomPlanModel: NSObject, ObservableObject {
         if tickPlan.followUpActions.shouldValidatePostShiftAlignment {
             validatePostShiftAlignment(with: frame)
         }
-        if tickPlan.followUpActions.shouldReconcileAfterPostShift {
+        if tickPlan.followUpActions.shouldReconcileAfterPostShift && !meshOnlyTestModeEnabled {
             reconcileARKitRelocalizationAgainstMeshOverride(with: frame)
         }
 
         tickPlan = RelocalizationCoordinator.appLocalizationTickPlan(
-            localizationState: localizationState,
+            localizationState: appDecisionLocalizationState,
             loadRequestedAt: loadRequestedAt,
             appLocalizationState: appLocalizationState,
+            meshOnlyTestModeEnabled: meshOnlyTestModeEnabled,
             meshFallbackActive: meshFallbackState.active,
             meshResult: meshFallbackState.result,
             hasAppliedWorldOriginShiftForCurrentAttempt: hasAppliedWorldOriginShiftForCurrentAttempt,
@@ -727,6 +1035,11 @@ final class RoomPlanModel: NSObject, ObservableObject {
             appLocalizationState = .searching
             if let statusText = tickPlan.resetStatusText {
                 meshOverrideStatusText = statusText
+                recordLocalizationEvent(
+                    .meshAligningReset,
+                    confidence: meshFallbackState.result?.confidence,
+                    details: statusText
+                )
             }
         }
 
@@ -742,9 +1055,15 @@ final class RoomPlanModel: NSObject, ObservableObject {
         let confidencePercent = Int((acceptance.confidence * 100).rounded())
         meshFallbackPromptText = "Aligned via mesh override (\(confidencePercent)%). Move slowly while ARKit continues confirming."
         guidanceText = meshFallbackPromptText ?? guidanceText
+        recordLocalizationEvent(
+            .meshAccepted,
+            confidence: acceptance.confidence,
+            details: "Promoted to meshAlignedOverride with \(acceptance.supportingFrames) supporting frame(s)"
+        )
     }
 
     func promoteToARKitConfirmed() {
+        guard !meshOnlyTestModeEnabled else { return }
         appLocalizationState = .arkitConfirmed
         if acceptedMeshAlignment != nil {
             appLocalizationSource = .arkitAndMeshConsistent
@@ -757,6 +1076,11 @@ final class RoomPlanModel: NSObject, ObservableObject {
         meshOverrideStatusText = RelocalizationCoordinator.arkitConfirmedMeshOverrideStatusText(
             hasAppliedWorldOriginShift: hasAppliedWorldOriginShiftForCurrentAttempt
         )
+        recordLocalizationEvent(
+            .arkitPromoted,
+            confidence: latestLocalizationConfidence,
+            details: meshOverrideStatusText
+        )
     }
 
     func degradeAppLocalization(reason: String) {
@@ -765,6 +1089,11 @@ final class RoomPlanModel: NSObject, ObservableObject {
         localizationConflictText = nil
         meshOverrideStatusText = "Mesh Override: Degraded"
         guidanceText = RelocalizationCoordinator.degradedGuidanceText(reason: reason)
+        recordLocalizationEvent(
+            .degraded,
+            confidence: effectiveLocalizationConfidenceForEvent(),
+            details: reason
+        )
     }
 
     func enterLocalizationConflict(_ conflict: LocalizationConflictSnapshot) {
@@ -774,6 +1103,11 @@ final class RoomPlanModel: NSObject, ObservableObject {
         localizationConflictText = presentation.localizationConflictText
         meshOverrideStatusText = "Mesh Override: Conflict detected"
         guidanceText = presentation.guidanceText
+        recordLocalizationEvent(
+            .conflictDetected,
+            confidence: conflict.meshConfidenceAtConflict,
+            details: "Δpos \(String(format: "%.2f", conflict.positionDeltaMeters))m, Δyaw \(String(format: "%.0f", conflict.yawDeltaDegrees))°"
+        )
     }
 
     func evaluateMeshAlignmentCandidate(_ result: MeshRelocalizationResult) -> Bool {
@@ -788,6 +1122,32 @@ final class RoomPlanModel: NSObject, ObservableObject {
         meshAlignmentCandidateBuffer = outcome.updatedBuffer
         if let status = outcome.statusText {
             meshOverrideStatusText = status
+            if status.contains("Rejected") {
+                recordLocalizationEvent(
+                    .meshCandidateRejected,
+                    confidence: result.confidence,
+                    details: status
+                )
+            } else if status.contains("waiting for stability") {
+                recordLocalizationEvent(
+                    .meshCandidateStabilizing,
+                    confidence: result.confidence,
+                    details: status
+                )
+            }
+        }
+        if let acceptance = outcome.acceptance {
+            recordLocalizationEvent(
+                .meshAccepted,
+                confidence: acceptance.confidence,
+                details: String(
+                    format: "Stable mesh acceptance conf %.0f%% residual %.2fm overlap %.0f%% yaw±%.0f°",
+                    acceptance.confidence * 100,
+                    acceptance.residualErrorMeters,
+                    acceptance.overlapRatio * 100,
+                    acceptance.yawConfidenceDegrees
+                )
+            )
         }
         return outcome.acceptance
     }
@@ -796,6 +1156,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
         guard !hasAppliedWorldOriginShiftForCurrentAttempt else { return }
         guard let session = sceneView?.session else { return }
         preShiftSessionPoseSnapshot = currentPoseTransform
+        // v1 strategy intentionally applies only yaw + XZ correction from mesh alignment.
+        // This avoids vertical/tilt jumps and keeps the override predictable for guidance.
         let relative = computeWorldOriginRelativeTransform(from: acceptance.mapFromSessionTransform)
         session.setWorldOrigin(relativeTransform: relative)
         hasAppliedWorldOriginShiftForCurrentAttempt = true
@@ -807,9 +1169,15 @@ final class RoomPlanModel: NSObject, ObservableObject {
             acceptance.overlapRatio * 100
         )
         meshOverrideStatusText = "Mesh Override: Applied world-origin shift"
+        recordLocalizationEvent(
+            .worldOriginShiftApplied,
+            confidence: acceptance.confidence,
+            details: worldOriginShiftDebugText
+        )
     }
 
     func computeWorldOriginRelativeTransform(from mapFromSession: simd_float4x4) -> simd_float4x4 {
+        // Intentional Phase 2.8 behavior: mesh override authority is yaw + XZ only.
         mapFromSession
     }
 
@@ -947,7 +1315,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func relocalizationPipelineState() -> String {
-        FallbackRelocalizationCoordinator.pipelineState(
+        if meshOnlyTestModeEnabled {
+            return "Fallback isolation mode (ARKit app gating suppressed)"
+        }
+        return FallbackRelocalizationCoordinator.pipelineState(
             meshFallbackActive: meshFallbackState.active,
             roomSignatureFallbackActive: fallbackRelocalizationState.isActive
         )
@@ -962,6 +1333,84 @@ final class RoomPlanModel: NSObject, ObservableObject {
         if let guidance = presentation.guidanceOverride {
             guidanceText = guidance
         }
+    }
+
+    func refreshLocalizationEventLogStatus() {
+        do {
+            localizationEvents = try Phase1MapStore.loadLocalizationEvents()
+            updateLocalizationEventPresentation()
+        } catch {
+            localizationEvents = []
+            localizationEventCountText = "Localization Events: n/a"
+            localizationLastEventText = "Last Localization Event: unavailable (\(error.localizedDescription))"
+        }
+    }
+
+    func recordLocalizationEvent(
+        _ eventType: LocalizationEventType,
+        confidence: Float? = nil,
+        details: String
+    ) {
+        let record = LocalizationEventRecord(
+            eventType: eventType,
+            appState: appLocalizationState.displayLabel,
+            arkitState: localizationState.displayText,
+            confidence: confidence ?? effectiveLocalizationConfidenceForEvent(),
+            details: details
+        )
+        do {
+            try Phase1MapStore.appendLocalizationEvent(record)
+            localizationEvents.append(record)
+            let now = Date()
+            if now.timeIntervalSince(lastLocalizationEventPresentationUpdateAt) >= 0.25 || eventType == .conflictDetected || eventType == .degraded {
+                updateLocalizationEventPresentation()
+                lastLocalizationEventPresentationUpdateAt = now
+            }
+        } catch {
+            statusMessage = "Localization event log write failed: \(error.localizedDescription)"
+        }
+    }
+
+    func effectiveLocalizationConfidenceForEvent() -> Float {
+        acceptedMeshAlignment?.confidence
+            ?? meshFallbackState.result?.confidence
+            ?? latestLocalizationConfidence
+    }
+
+    func updateLocalizationEventPresentation() {
+        localizationEventCountText = "Localization Events: \(localizationEvents.count)"
+        guard let latest = localizationEvents.last else {
+            localizationLastEventText = "Last Localization Event: n/a"
+            return
+        }
+        let confidencePercent = Int((max(0, min(1, latest.confidence)) * 100).rounded())
+        localizationLastEventText = "Last Localization Event: \(latest.eventType.rawValue) (\(confidencePercent)%)"
+    }
+
+    var debugAppLocalizationState: AppLocalizationState { appLocalizationState }
+    var debugHasAppliedWorldOriginShiftForCurrentAttempt: Bool { hasAppliedWorldOriginShiftForCurrentAttempt }
+    var debugLocalizationEventCount: Int { localizationEvents.count }
+    var debugMeshFallbackActive: Bool { meshFallbackState.active }
+    var debugRelocalizationAttemptMode: RelocalizationAttemptMode? { relocalizationAttemptState?.mode }
+    var debugCachedSavedMeshPointsCount: Int { cachedSavedMeshPoints.count }
+
+    func debugSetAwaitingRelocalizationForTesting(_ value: Bool) {
+        awaitingRelocalization = value
+    }
+
+    func debugActivateMeshFallbackForTesting() {
+        meshFallbackState = MeshFallbackState(
+            active: true,
+            phase: .coarseMatching,
+            startedAt: Date(),
+            progressText: "Testing",
+            result: nil
+        )
+    }
+
+    func debugSetSavedMeshArtifactForTesting(_ artifact: MeshMapArtifact?) {
+        savedMeshArtifact = artifact
+        refreshCachedSavedMeshPoints()
     }
 
     func refreshSavedMapState() {
@@ -1231,6 +1680,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         sessionYawCoverageAccumulated = 0
         sessionTranslationAccumulated = 0
         resetRelocalizationAttemptState()
+        clearRuntimeFallbackCaches(keepSavedMeshCache: false)
         yawJitterSamples.removeAll()
         yawSweepAccumulated = 0
         yawSweepWindowStart = Date()
@@ -1246,8 +1696,53 @@ final class RoomPlanModel: NSObject, ObservableObject {
         refreshAnchorActionAvailability()
     }
 
+    func clearRuntimeFallbackCaches(keepSavedMeshCache: Bool) {
+        meshAlignmentCandidateBuffer.removeAll()
+        pendingFallbackAcceptance = nil
+        lastVisionCandidateEvaluationAt = .distantPast
+        meshFallbackLastEvaluationAt = .distantPast
+        memoryPressureRelaxedUntil = .distantPast
+        if !keepSavedMeshCache {
+            cachedSavedMeshPoints.removeAll()
+        }
+    }
+
+    func handleMemoryWarning() {
+        clearRuntimeFallbackCaches(keepSavedMeshCache: true)
+        memoryPressureRelaxedUntil = Date().addingTimeInterval(20)
+        statusMessage = "Memory pressure detected: fallback sampling temporarily throttled."
+    }
+
     private func updateRelocalizationState(with frame: ARFrame) {
-        let tracking = frame.camera.trackingState
+        updateRelocalizationStateForTracking(frame.camera.trackingState)
+    }
+
+    func updateRelocalizationStateForTracking(_ tracking: ARCamera.TrackingState) {
+        if meshOnlyTestModeEnabled, awaitingRelocalization {
+            if relocalizationAttemptState == nil { beginRelocalizationAttempt() }
+            switch tracking {
+            case .limited(.relocalizing):
+                sawRelocalizingState = true
+                stableNormalFramesAfterLoad = 0
+                localizationState = .relocalizing
+                relocalizationText = "Mesh-only isolation: ARKit relocalizing (ignored for app localization)"
+            case .normal:
+                stableNormalFramesAfterLoad += 1
+                localizationState = .relocalizing
+                relocalizationText = "Mesh-only isolation: ARKit tracking normal (ignored for app localization)"
+                statusMessage = "Mesh-only test mode: waiting for fallback alignment"
+            case .limited:
+                stableNormalFramesAfterLoad = 0
+                localizationState = .relocalizing
+                relocalizationText = "Mesh-only isolation: tracking limited; continue fallback scanning"
+            case .notAvailable:
+                stableNormalFramesAfterLoad = 0
+                localizationState = .unknown
+            }
+            refreshAnchorActionAvailability()
+            return
+        }
+
         if case .limited(.relocalizing) = tracking {
             if awaitingRelocalization { sawRelocalizingState = true }
             if relocalizationAttemptState == nil { beginRelocalizationAttempt() }
@@ -1274,10 +1769,15 @@ final class RoomPlanModel: NSObject, ObservableObject {
             if stableNormalFramesAfterLoad > 15 && longEnoughSinceLoad {
                 awaitingRelocalization = false
                 localizationState = .localized
-                relocalizationText = sawRelocalizingState
-                    ? "Relocalized to saved map (ARKit tracking normal)"
-                    : "Tracking normal after map load (likely relocalized)"
-                statusMessage = "Localization ready"
+                if meshOnlyTestModeEnabled {
+                    relocalizationText = "ARKit relocalized (ignored in mesh-only test mode)"
+                    statusMessage = "Mesh-only test mode: waiting for fallback alignment"
+                } else {
+                    relocalizationText = sawRelocalizingState
+                        ? "Relocalized to saved map (ARKit tracking normal)"
+                        : "Tracking normal after map load (likely relocalized)"
+                    statusMessage = "Localization ready"
+                }
                 resetRelocalizationAttemptState()
             }
         } else {
@@ -1298,7 +1798,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
             guidanceText = appLocalizationPromptText
             return
         }
-        if awaitingRelocalization || localizationState == .relocalizing {
+        if awaitingRelocalization
+            || localizationState == .relocalizing
+            || (meshOnlyTestModeEnabled && (appLocalizationState == .searching || appLocalizationState == .meshAligning))
+        {
             if relocalizationAttemptState == nil { beginRelocalizationAttempt() }
             refreshRelocalizationGuidanceUI()
             return

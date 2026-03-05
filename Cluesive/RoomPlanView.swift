@@ -52,6 +52,7 @@ struct RoomPlanView: View {
             model.loadAnchorsFromDisk()
             model.refreshRoomSignatureStatus()
             model.refreshMeshArtifactStatus()
+            model.refreshLocalizationEventLogStatus()
             if !model.isSessionRunning {
                 model.startFreshScan()
             }
@@ -115,14 +116,35 @@ struct RoomPlanView: View {
                         Text(model.meshOverrideStatusText)
                         Text(model.worldOriginShiftDebugText)
                             .fixedSize(horizontal: false, vertical: true)
+                        Text(model.localizationEventCountText)
+                        Text(model.localizationLastEventText)
+                            .fixedSize(horizontal: false, vertical: true)
                         Text(model.relocalizationAttemptModeText)
                         Text(model.relocalizationAttemptProgressText)
                             .fixedSize(horizontal: false, vertical: true)
                         Text(model.meshFallbackText)
                         Text(model.meshFallbackPhaseText)
                         Text(model.meshFallbackConfidenceText)
+                        Text(model.fallbackModeText)
+                        Text(model.fallbackConfidenceBandText)
+                        Text(model.fallbackLatencyMsText)
                         Text(model.meshPoseSeedText)
                             .fixedSize(horizontal: false, vertical: true)
+                        if model.fallbackNeedsConfirmation {
+                            Text(model.fallbackConfirmationPromptText ?? "Provisional alignment found.")
+                                .foregroundStyle(.yellow)
+                                .fixedSize(horizontal: false, vertical: true)
+                            HStack(spacing: 8) {
+                                Button("Confirm Fallback") {
+                                    model.confirmFallbackAlignment()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                Button("Reject") {
+                                    model.rejectFallbackAlignment()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
                         if let meshPrompt = model.meshFallbackPromptText {
                             Text("Mesh fallback: \(meshPrompt)")
                                 .fixedSize(horizontal: false, vertical: true)
@@ -180,14 +202,35 @@ struct RoomPlanView: View {
                         Text(model.meshOverrideStatusText)
                         Text(model.worldOriginShiftDebugText)
                             .fixedSize(horizontal: false, vertical: true)
+                        Text(model.localizationEventCountText)
+                        Text(model.localizationLastEventText)
+                            .fixedSize(horizontal: false, vertical: true)
                         Text(model.relocalizationAttemptModeText)
                         Text(model.relocalizationAttemptProgressText)
                             .fixedSize(horizontal: false, vertical: true)
                         Text(model.meshFallbackText)
                         Text(model.meshFallbackPhaseText)
                         Text(model.meshFallbackConfidenceText)
+                        Text(model.fallbackModeText)
+                        Text(model.fallbackConfidenceBandText)
+                        Text(model.fallbackLatencyMsText)
                         Text(model.meshPoseSeedText)
                             .fixedSize(horizontal: false, vertical: true)
+                        if model.fallbackNeedsConfirmation {
+                            Text(model.fallbackConfirmationPromptText ?? "Provisional alignment found.")
+                                .foregroundStyle(.yellow)
+                                .fixedSize(horizontal: false, vertical: true)
+                            HStack(spacing: 8) {
+                                Button("Confirm Fallback") {
+                                    model.confirmFallbackAlignment()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                Button("Reject") {
+                                    model.rejectFallbackAlignment()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
                         if let meshPrompt = model.meshFallbackPromptText {
                             Text("Mesh fallback: \(meshPrompt)")
                                 .fixedSize(horizontal: false, vertical: true)
@@ -196,6 +239,16 @@ struct RoomPlanView: View {
                         Text(model.fallbackRelocalizationModeText)
                         Text(model.fallbackRelocalizationConfidenceText)
                         Text("Pipeline: \(model.relocalizationPipelineState())")
+                        Toggle("Fallback-isolation test mode", isOn: $model.meshOnlyTestModeEnabled)
+                        Text("Debug only: disables ARWorldMap relocalization attempts, keeps ARKit tracking visible for diagnostics, and keeps app state in Searching until fallback is accepted.")
+                            .font(.caption2)
+                            .foregroundStyle(.yellow)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Start Fallback Now") {
+                            model.startFallbackIsolationNow()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.meshOnlyTestModeEnabled)
                         if let fallbackPrompt = model.fallbackRelocalizationPromptText {
                             Text("Fallback prompt: \(fallbackPrompt)")
                                 .fixedSize(horizontal: false, vertical: true)

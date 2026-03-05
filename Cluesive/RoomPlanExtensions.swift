@@ -102,11 +102,18 @@ extension ARMeshAnchor {
         guard !vertices.isEmpty else { return nil }
         let normals = geometry.extractNormals()
         let faces = geometry.extractTriangleIndices(vertexCount: vertices.count)
+        let sanitizedTransform = transform.flatArray.map { $0.isFinite ? $0 : 0 }
+        let sanitizedVertices = vertices.flatMap { point in
+            [point.x, point.y, point.z].map { $0.isFinite ? $0 : 0 }
+        }
+        let sanitizedNormals = normals.isEmpty ? nil : normals.flatMap { normal in
+            [normal.x, normal.y, normal.z].map { $0.isFinite ? $0 : 0 }
+        }
         return MeshAnchorRecord(
             id: identifier,
-            transform: transform.flatArray,
-            vertices: vertices.flatMap { [$0.x, $0.y, $0.z] },
-            normals: normals.isEmpty ? nil : normals.flatMap { [$0.x, $0.y, $0.z] },
+            transform: sanitizedTransform,
+            vertices: sanitizedVertices,
+            normals: sanitizedNormals,
             faces: faces,
             capturedAt: Date(),
             classificationSummary: nil
