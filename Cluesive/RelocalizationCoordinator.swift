@@ -54,6 +54,26 @@ enum RelocalizationCoordinator {
         return true
     }
 
+    static func meshCandidateRejectionReasons(_ result: MeshRelocalizationResult) -> [String] {
+        var reasons: [String] = []
+        if result.confidence < 0.80 {
+            reasons.append(String(format: "confidence %.0f%% < 80%%", result.confidence * 100))
+        }
+        if result.residualErrorMeters > 0.20 {
+            reasons.append(String(format: "residual %.2fm > 0.20m", result.residualErrorMeters))
+        }
+        if result.overlapRatio < 0.35 {
+            reasons.append(String(format: "overlap %.0f%% < 35%%", result.overlapRatio * 100))
+        }
+        if result.yawConfidenceDegrees > 12 {
+            reasons.append(String(format: "yaw±%.0f° > 12°", result.yawConfidenceDegrees))
+        }
+        if result.supportingPointCount < 250 {
+            reasons.append("support points < 250")
+        }
+        return reasons
+    }
+
     static func stabilizeMeshAlignmentCandidate(
         buffer: [MeshRelocalizationResult],
         result: MeshRelocalizationResult,
@@ -66,11 +86,13 @@ enum RelocalizationCoordinator {
         }
 
         guard evaluateMeshAlignmentCandidate(result) else {
+            let rejectionReasons = meshCandidateRejectionReasons(result).joined(separator: ", ")
             let status = String(
-                format: "Mesh Override: Rejected (conf %.0f%%, residual %.2fm, overlap %.0f%%)",
+                format: "Mesh Override: Rejected (conf %.0f%%, residual %.2fm, overlap %.0f%%)%@",
                 result.confidence * 100,
                 result.residualErrorMeters,
-                result.overlapRatio * 100
+                result.overlapRatio * 100,
+                rejectionReasons.isEmpty ? "" : " [\(rejectionReasons)]"
             )
             return MeshStabilizationOutcome(updatedBuffer: updatedBuffer, acceptance: nil, statusText: status)
         }

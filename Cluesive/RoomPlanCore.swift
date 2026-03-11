@@ -313,6 +313,22 @@ struct VisionPlaceCandidate {
     let confidence: Float
 }
 
+struct VisionRetrievalDiagnostics {
+    let selectedDistance: Float?
+    let topCandidateDistances: [Float]
+    let candidateCount: Int
+    let distinctiveness: Float
+}
+
+struct MeshFallbackDiagnostics {
+    let coarseConfidence: Float
+    let structureScore: Float
+    let visionScore: Float
+    let yawPenalty: Float
+    let extentPenalty: Float
+    let finalScore: Float
+}
+
 struct MeshRelocalizationResult {
     let coarsePoseSeed: MeshRelocalizationHypothesis?
     let refinedPoseSeed: MeshRelocalizationHypothesis?
@@ -327,6 +343,8 @@ struct MeshRelocalizationResult {
     let debugReason: String
     let confidenceBand: FallbackConfidenceBand
     let visionSeedDistance: Float?
+    let visionDiagnostics: VisionRetrievalDiagnostics?
+    let diagnostics: MeshFallbackDiagnostics?
 
     init(
         coarsePoseSeed: MeshRelocalizationHypothesis?,
@@ -341,7 +359,9 @@ struct MeshRelocalizationResult {
         isStableAcrossFrames: Bool,
         debugReason: String,
         confidenceBand: FallbackConfidenceBand = .low,
-        visionSeedDistance: Float? = nil
+        visionSeedDistance: Float? = nil,
+        visionDiagnostics: VisionRetrievalDiagnostics? = nil,
+        diagnostics: MeshFallbackDiagnostics? = nil
     ) {
         self.coarsePoseSeed = coarsePoseSeed
         self.refinedPoseSeed = refinedPoseSeed
@@ -356,6 +376,8 @@ struct MeshRelocalizationResult {
         self.debugReason = debugReason
         self.confidenceBand = confidenceBand
         self.visionSeedDistance = visionSeedDistance
+        self.visionDiagnostics = visionDiagnostics
+        self.diagnostics = diagnostics
     }
 }
 

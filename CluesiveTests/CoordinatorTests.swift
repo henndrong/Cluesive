@@ -202,6 +202,31 @@ final class RelocalizationCoordinatorTests: XCTestCase {
         )
     }
 
+    func testMeshCandidateRejectionReasonsEnumeratesFailedThresholds() {
+        let result = MeshRelocalizationResult(
+            coarsePoseSeed: nil,
+            refinedPoseSeed: nil,
+            orientationHintDegrees: nil,
+            areaHint: nil,
+            confidence: 0.42,
+            residualErrorMeters: 0.31,
+            overlapRatio: 0.12,
+            yawConfidenceDegrees: 19,
+            supportingPointCount: 80,
+            isStableAcrossFrames: false,
+            debugReason: "test"
+        )
+
+        let reasons = RelocalizationCoordinator.meshCandidateRejectionReasons(result)
+
+        XCTAssertEqual(reasons.count, 5)
+        XCTAssertTrue(reasons.contains(where: { $0.contains("confidence") }))
+        XCTAssertTrue(reasons.contains(where: { $0.contains("residual") }))
+        XCTAssertTrue(reasons.contains(where: { $0.contains("overlap") }))
+        XCTAssertTrue(reasons.contains(where: { $0.contains("yaw") }))
+        XCTAssertTrue(reasons.contains(where: { $0.contains("support points") }))
+    }
+
     private func makeStrongMeshResult(yawDegrees: Float, translation: SIMD2<Float>) -> MeshRelocalizationResult {
         let seed = MeshRelocalizationHypothesis(
             yawDegrees: yawDegrees,
@@ -221,6 +246,142 @@ final class RelocalizationCoordinatorTests: XCTestCase {
             supportingPointCount: 350,
             isStableAcrossFrames: true,
             debugReason: "test"
+        )
+    }
+}
+
+final class MeshRelocalizationEngineTests: XCTestCase {
+    func testMergeVisionFeatureRecordKeepsDiverseRecentKeyframes() {
+        let baseTime = Date(timeIntervalSince1970: 1_000)
+        let records = [
+            makeVisionRecord(baseTime.addingTimeInterval(0), translation: SIMD2<Float>(0, 0), yawDegrees: 0),
+            makeVisionRecord(baseTime.addingTimeInterval(1), translation: SIMD2<Float>(0.1, 0.1), yawDegrees: 5),
+            makeVisionRecord(baseTime.addingTimeInterval(2), translation: SIMD2<Float>(1.2, 0), yawDegrees: 40),
+            makeVisionRecord(baseTime.addingTimeInterval(3), translation: SIMD2<Float>(2.3, 0.4), yawDegrees: 90)
+        ]
+
+        var merged: [VisionFeatureRecord] = []
+        for record in records {
+            merged = MeshRelocalizationEngine.mergeVisionFeatureRecord(existing: merged, candidate: record, maxRecords: 3)
+        }
+
+        XCTAssertEqual(merged.count, 3)
+        XCTAssertEqual(merged.last?.capturedAt, baseTime.addingTimeInterval(3))
+        XCTAssertFalse(merged.contains(where: { $0.capturedAt == baseTime.addingTimeInterval(1) }))
+    }
+
+    func testDownsampleSavedMeshPointsUsesAnchorWorldTransform() {
+        let record = MeshAnchorRecord(
+            id: UUID(),
+            transform: simd_float4x4(
+                yawRadians: 0,
+                translation: SIMD3<Float>(2, 0, -1)
+            ).flatArray,
+            vertices: [
+                0, 0, 0,
+                1, 0, 0
+            ],
+            normals: nil,
+            faces: [],
+            capturedAt: Date(),
+            classificationSummary: nil
+        )
+        let artifact = MeshMapArtifact(
+            mapName: "test",
+            capturedAt: Date(),
+            meshAnchors: [record],
+            descriptor: MeshRelocalizationEngine.buildMeshSignatureDescriptor(from: [record]),
+            version: 1
+        )
+
+        let points = MeshRelocalizationEngine.downsampleSavedMeshPoints(artifact, maxPoints: 10)
+
+        XCTAssertEqual(points.count, 2)
+        XCTAssertEqual(points[0].x, 2, accuracy: 0.001)
+        XCTAssertEqual(points[0].z, -1, accuracy: 0.001)
+        XCTAssertEqual(points[1].x, 3, accuracy: 0.001)
+        XCTAssertEqual(points[1].z, -1, accuracy: 0.001)
+    }
+
+    func testAlignmentVerificationMetricsReflectGoodAndBadTransforms() {
+        let saved = [
+            SIMD3<Float>(0, 0, 0),
+            SIMD3<Float>(1, 0, 0),
+            SIMD3<Float>(0, 0, 1)
+        ]
+        let live = [
+            SIMD3<Float>(0, 0, 0),
+            SIMD3<Float>(1, 0, 0),
+            SIMD3<Float>(0, 0, 1)
+        ]
+
+        let good = MeshRelocalizationEngine.alignmentVerificationMetrics(
+            livePoints: live,
+            savedPoints: saved,
+            mapFromSessionTransform: matrix_identity_float4x4
+        )
+        let bad = MeshRelocalizationEngine.alignmentVerificationMetrics(
+            livePoints: live,
+            savedPoints: saved,
+            mapFromSessionTransform: simd_float4x4(
+                yawRadians: 0,
+                translation: SIMD3<Float>(2, 0, 2)
+            )
+        )
+
+        XCTAssertLessThan(good.residualErrorMeters, 0.01)
+        XCTAssertGreaterThan(good.overlapRatio, 0.95)
+        XCTAssertGreaterThan(bad.residualErrorMeters, good.residualErrorMeters)
+        XCTAssertLessThan(bad.overlapRatio, good.overlapRatio)
+    }
+
+    func testBuildStructureSignatureExtractsLongVerticalSegments() {
+        let wallA = makeWallRecord(z: 0)
+        let wallB = makeWallRecord(z: 2)
+        let mesh = MeshMapArtifact(
+            mapName: "test",
+            capturedAt: Date(),
+            meshAnchors: [wallA, wallB],
+            descriptor: MeshRelocalizationEngine.buildMeshSignatureDescriptor(from: [wallA, wallB]),
+            version: 1
+        )
+
+        let structure = MeshRelocalizationEngine.buildStructureSignature(from: mesh)
+
+        XCTAssertNotNil(structure)
+        XCTAssertGreaterThanOrEqual(structure?.structuralSegments.count ?? 0, 2)
+        XCTAssertTrue((structure?.structuralSegments.allSatisfy { simd_distance($0.start, $0.end) > 1.0 }) ?? false)
+    }
+
+    private func makeVisionRecord(_ date: Date, translation: SIMD2<Float>, yawDegrees: Float) -> VisionFeatureRecord {
+        let transform = simd_float4x4(
+            yawRadians: yawDegrees * .pi / 180,
+            translation: SIMD3<Float>(translation.x, 0, translation.y)
+        )
+        return VisionFeatureRecord(
+            id: UUID(),
+            capturedAt: date,
+            mapFromSessionTransform: transform.flatArray,
+            featurePrintData: Data([0x01, 0x02, 0x03])
+        )
+    }
+
+    private func makeWallRecord(z: Float) -> MeshAnchorRecord {
+        var vertices: [Float] = []
+        var normals: [Float] = []
+        for index in 0..<40 {
+            let x = Float(index) * 0.15
+            vertices.append(contentsOf: [x, 1.0, z])
+            normals.append(contentsOf: [0, 0, 1])
+        }
+        return MeshAnchorRecord(
+            id: UUID(),
+            transform: matrix_identity_float4x4.flatArray,
+            vertices: vertices,
+            normals: normals,
+            faces: [],
+            capturedAt: Date(),
+            classificationSummary: nil
         )
     }
 }

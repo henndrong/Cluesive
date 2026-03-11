@@ -56,6 +56,16 @@ extension simd_float4x4 {
         let norm = forward / mag
         return atan2(norm.z, norm.x)
     }
+
+    nonisolated func transformPoint(_ point: SIMD3<Float>) -> SIMD3<Float> {
+        let transformed = self * SIMD4<Float>(point.x, point.y, point.z, 1)
+        return SIMD3<Float>(transformed.x, transformed.y, transformed.z)
+    }
+
+    nonisolated func rotateVector(_ vector: SIMD3<Float>) -> SIMD3<Float> {
+        let transformed = self * SIMD4<Float>(vector.x, vector.y, vector.z, 0)
+        return SIMD3<Float>(transformed.x, transformed.y, transformed.z)
+    }
 }
 
 extension Array where Element == Float {

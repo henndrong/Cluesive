@@ -169,6 +169,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
     private var meshFallbackEvaluationIntervalSeconds: TimeInterval = 0.75
     private var visionCandidateEvaluationIntervalSeconds: TimeInterval = 2.0
     private var lastVisionCandidateEvaluationAt: Date = .distantPast
+    private var runtimeVisionKeyframeBuffer: [VisionFeatureRecord] = []
+    private var lastRuntimeVisionKeyframeCaptureAt: Date = .distantPast
     private var memoryPressureRelaxedUntil: Date = .distantPast
     private var meshFallbackSoftTimeoutLogged = false
     private var fallbackLocalizationMode: FallbackLocalizationMode = .hybridGeometryVision
@@ -230,6 +232,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
         awaitingRelocalization = false
         loadRequestedAt = nil
         clearRuntimeFallbackCaches(keepSavedMeshCache: false)
+        runtimeVisionKeyframeBuffer.removeAll()
+        lastRuntimeVisionKeyframeCaptureAt = .distantPast
         resetAppLocalizationStateForNewAttempt()
     }
 
@@ -394,8 +398,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     func captureVisionIndexIfAvailable(from frame: ARFrame?) {
-        guard let frame else { return }
-        guard let artifact = MeshRelocalizationEngine.buildVisionIndex(from: frame) else { return }
+        guard let artifact = buildVisionIndexArtifact(from: frame) else { return }
         do {
             try Phase1MapStore.saveVisionIndex(artifact)
             savedVisionIndexArtifact = artifact
@@ -427,6 +430,28 @@ final class RoomPlanModel: NSObject, ObservableObject {
             return
         }
         cachedSavedMeshPoints = MeshRelocalizationEngine.downsampleSavedMeshPoints(saved, maxPoints: 1200)
+    }
+
+    func buildVisionIndexArtifact(from frame: ARFrame?) -> VisionIndexArtifact? {
+        guard let frame else { return nil }
+        var records = runtimeVisionKeyframeBuffer
+        if let currentRecord = MeshRelocalizationEngine.makeVisionFeatureRecord(from: frame) {
+            records = MeshRelocalizationEngine.mergeVisionFeatureRecord(existing: records, candidate: currentRecord)
+        }
+        return MeshRelocalizationEngine.buildVisionIndex(from: records)
+    }
+
+    func updateRuntimeVisionKeyframeBuffer(with frame: ARFrame) {
+        let now = Date()
+        guard now.timeIntervalSince(lastRuntimeVisionKeyframeCaptureAt) >= 0.6 else { return }
+        guard frame.worldMappingStatus == .mapped || frame.worldMappingStatus == .extending else { return }
+        guard (frame.rawFeaturePoints?.points.count ?? 0) >= 120 else { return }
+        guard let record = MeshRelocalizationEngine.makeVisionFeatureRecord(from: frame) else { return }
+        runtimeVisionKeyframeBuffer = MeshRelocalizationEngine.mergeVisionFeatureRecord(
+            existing: runtimeVisionKeyframeBuffer,
+            candidate: record
+        )
+        lastRuntimeVisionKeyframeCaptureAt = now
     }
 
     func resetAppLocalizationStateForNewAttempt() {
@@ -723,12 +748,13 @@ final class RoomPlanModel: NSObject, ObservableObject {
            now.timeIntervalSince(lastVisionCandidateEvaluationAt) >= visionCandidateEvaluationIntervalSeconds
         {
             lastVisionCandidateEvaluationAt = now
-            if let candidate = MeshRelocalizationEngine.retrieveVisionPlaceCandidate(from: frame, saved: vision) {
+            let selection = MeshRelocalizationEngine.retrieveVisionPlaceCandidateSelection(from: frame, saved: vision)
+            if let candidate = selection.candidate {
                 visionCandidate = candidate
                 recordLocalizationEvent(
                     .visionCandidateSelected,
                     confidence: candidate.confidence,
-                    details: String(format: "Vision prior selected (distance %.3f)", candidate.distance)
+                    details: visionDiagnosticsSummary(selection.diagnostics)
                 )
             }
         }
@@ -769,6 +795,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
             saved: saved,
             savedPoints: cachedSavedMeshPoints,
             livePoints: liveFallbackInput.points,
+            liveNormals: liveFallbackInput.normals,
             liveDescriptor: liveFallbackInput.descriptor,
             savedStructure: savedStructureSignatureArtifact,
             savedVision: savedVisionIndexArtifact,
@@ -813,7 +840,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
                 recordLocalizationEvent(
                     .geometryRegistrationAccepted,
                     confidence: result.confidence,
-                    details: "High-confidence geometry registration"
+                    details: fallbackDiagnosticsSummary(for: result)
                 )
             case .needsUserConfirmation:
                 let firstRequest = !fallbackNeedsConfirmation
@@ -824,14 +851,24 @@ final class RoomPlanModel: NSObject, ObservableObject {
                     recordLocalizationEvent(
                         .confirmationRequested,
                         confidence: result.confidence,
-                        details: "Medium-confidence fallback requires confirmation"
+                        details: fallbackDiagnosticsSummary(for: result)
                     )
                 }
             case .reject:
                 meshFallbackPromptText = "Geometry match is too weak. Move closer to stable walls/corners and retry."
+                recordLocalizationEvent(
+                    .meshCandidateRejected,
+                    confidence: result.confidence,
+                    details: fallbackDiagnosticsSummary(for: result)
+                )
             }
         } else {
             meshFallbackPromptText = "Mesh geometry hint is weak. Move closer to a wall/corner and do a slow sweep, then retry relocalization."
+            recordLocalizationEvent(
+                .meshCandidateRejected,
+                confidence: result.confidence,
+                details: fallbackDiagnosticsSummary(for: result)
+            )
         }
         guidanceText = meshFallbackPromptText ?? guidanceText
     }
@@ -1126,13 +1163,13 @@ final class RoomPlanModel: NSObject, ObservableObject {
                 recordLocalizationEvent(
                     .meshCandidateRejected,
                     confidence: result.confidence,
-                    details: status
+                    details: "\(status) | \(fallbackDiagnosticsSummary(for: result))"
                 )
             } else if status.contains("waiting for stability") {
                 recordLocalizationEvent(
                     .meshCandidateStabilizing,
                     confidence: result.confidence,
-                    details: status
+                    details: "\(status) | \(fallbackDiagnosticsSummary(for: result))"
                 )
             }
         }
@@ -1146,7 +1183,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
                     acceptance.residualErrorMeters,
                     acceptance.overlapRatio * 100,
                     acceptance.yawConfidenceDegrees
-                )
+                ) + " | " + fallbackDiagnosticsSummary(for: result)
             )
         }
         return outcome.acceptance
@@ -1375,6 +1412,41 @@ final class RoomPlanModel: NSObject, ObservableObject {
         acceptedMeshAlignment?.confidence
             ?? meshFallbackState.result?.confidence
             ?? latestLocalizationConfidence
+    }
+
+    func visionDiagnosticsSummary(_ diagnostics: VisionRetrievalDiagnostics) -> String {
+        let topDistances = diagnostics.topCandidateDistances
+            .prefix(3)
+            .map { String(format: "%.3f", $0) }
+            .joined(separator: ",")
+        let selected = diagnostics.selectedDistance.map { String(format: "%.3f", $0) } ?? "n/a"
+        return "Vision selected=\(selected) topK=[\(topDistances)] candidates=\(diagnostics.candidateCount) distinctiveness=\(Int((diagnostics.distinctiveness * 100).rounded()))%"
+    }
+
+    func fallbackDiagnosticsSummary(for result: MeshRelocalizationResult) -> String {
+        var segments: [String] = []
+        if let diagnostics = result.diagnostics {
+            segments.append(
+                String(
+                    format: "score coarse %.0f%% structure %.0f%% vision %.0f%% yawPenalty %.0f%% extentPenalty %.0f%% final %.0f%%",
+                    diagnostics.coarseConfidence * 100,
+                    diagnostics.structureScore * 100,
+                    diagnostics.visionScore * 100,
+                    diagnostics.yawPenalty * 100,
+                    diagnostics.extentPenalty * 100,
+                    diagnostics.finalScore * 100
+                )
+            )
+        }
+        if let visionDiagnostics = result.visionDiagnostics {
+            segments.append(visionDiagnosticsSummary(visionDiagnostics))
+        }
+        let rejectionReasons = RelocalizationCoordinator.meshCandidateRejectionReasons(result)
+        if !rejectionReasons.isEmpty {
+            segments.append("reject=\(rejectionReasons.joined(separator: ","))")
+        }
+        segments.append(result.debugReason)
+        return segments.joined(separator: " | ")
     }
 
     func updateLocalizationEventPresentation() {
@@ -1875,6 +1947,7 @@ extension RoomPlanModel: ARSessionDelegate, ARSCNViewDelegate {
                 yaw * 180 / .pi
             )
 
+            self.updateRuntimeVisionKeyframeBuffer(with: frame)
             self.updateMotionHeuristics(currentTransform: transform, currentYaw: yaw)
             self.updateScanReadinessMetrics(with: frame, currentTransform: transform, currentYaw: yaw)
             self.updateRelocalizationState(with: frame)
