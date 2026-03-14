@@ -33,6 +33,13 @@ struct RoomPlanView: View {
         )
     }
 
+    private var destinationBinding: Binding<UUID?> {
+        Binding(
+            get: { model.selectedDestinationAnchorID },
+            set: { model.selectDestinationAnchor($0) }
+        )
+    }
+
     var body: some View {
         ZStack {
             RoomCaptureContainerView(model: model)
@@ -149,6 +156,53 @@ struct RoomPlanView: View {
                 Text("Graph saved: \(model.hasSavedNavGraph ? "Yes" : "No")")
                 Text(model.graphValidationText)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.caption)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Navigation Prep")
+                    .font(.caption.weight(.semibold))
+
+                if model.linkedDestinationAnchors.isEmpty {
+                    Text("Link at least one anchor to a graph waypoint to enable destinations.")
+                        .font(.caption2)
+                        .foregroundStyle(.yellow)
+                } else {
+                    Picker("Destination", selection: destinationBinding) {
+                        Text("Select destination").tag(Optional<UUID>.none)
+                        ForEach(model.linkedDestinationAnchors) { anchor in
+                            Text(anchor.name).tag(Optional(anchor.id))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+
+                HStack(spacing: 10) {
+                    Button("Plan Route") {
+                        model.planRouteToSelectedDestination()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.selectedDestinationAnchorID == nil || model.linkedDestinationAnchors.isEmpty)
+
+                    Button(model.isOrientationActive ? "Stop Orientation" : "Start Orientation") {
+                        if model.isOrientationActive {
+                            model.stopOrientation()
+                        } else {
+                            model.startOrientationToRoute()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!model.isOrientationActive && !model.canStartOrientation)
+                }
+
+                Text(model.orientationReadinessText)
+                Text(model.plannedRouteSummaryText)
+                Text(model.orientationStatusText)
+                Text(model.orientationDeltaText)
+                if model.orientationReadyToNavigate {
+                    Text("Ready to navigate")
+                        .foregroundStyle(.green)
+                }
             }
             .font(.caption)
 

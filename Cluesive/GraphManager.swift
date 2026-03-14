@@ -123,6 +123,23 @@ enum GraphManager {
             .0
     }
 
+    static func nearestNode(
+        to position: SIMD3<Float>,
+        in graph: NavGraphArtifact,
+        thresholdMeters: Float
+    ) -> NavGraphNode? {
+        graph.nodes
+            .map { node in (node, edgeDistance(from: node.position, to: position)) }
+            .filter { $0.1 <= thresholdMeters }
+            .sorted { $0.1 < $1.1 }
+            .first?
+            .0
+    }
+
+    static func node(forLinkedAnchorID anchorID: UUID, in graph: NavGraphArtifact) -> NavGraphNode? {
+        graph.nodes.first { $0.linkedAnchorID == anchorID }
+    }
+
     static func validate(graph: NavGraphArtifact, anchors: [SavedSemanticAnchor]) -> GraphValidationResult {
         var warnings: [String] = []
         var disconnectedNodeIDs: [UUID] = []
@@ -161,7 +178,7 @@ enum GraphManager {
         }
 
         if graph.nodes.count > 1 {
-            let adjacency = buildAdjacency(graph: graph)
+            let adjacency = adjacency(graph: graph)
             let reachable = traverse(start: graph.nodes[0].id, adjacency: adjacency)
             disconnectedNodeIDs = graph.nodes.map(\.id).filter { !reachable.contains($0) }
             if !disconnectedNodeIDs.isEmpty {
@@ -188,7 +205,7 @@ enum GraphManager {
         )
     }
 
-    private static func buildAdjacency(graph: NavGraphArtifact) -> [UUID: Set<UUID>] {
+    static func adjacency(graph: NavGraphArtifact) -> [UUID: Set<UUID>] {
         var adjacency: [UUID: Set<UUID>] = [:]
         for node in graph.nodes {
             adjacency[node.id] = adjacency[node.id, default: []]

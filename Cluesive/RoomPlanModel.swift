@@ -100,6 +100,13 @@ final class RoomPlanModel: NSObject, ObservableObject {
     @Published var graphValidationText = "Graph: 0 nodes, 0 edges"
     @Published var graphAnchorLinkText: String?
     @Published var hasSavedNavGraph = false
+    @Published var orientationReadinessText = "Orientation readiness: Not Ready"
+    @Published var selectedDestinationAnchorID: UUID?
+    @Published var plannedRouteSummaryText = "Route: none"
+    @Published var orientationStatusText = "Orientation: idle"
+    @Published var orientationDeltaText = "Orientation delta: n/a"
+    @Published var orientationReadyToNavigate = false
+    @Published var isOrientationActive = false
     @Published var meshOnlyTestModeEnabled = false {
         didSet {
             if meshOnlyTestModeEnabled {
@@ -197,6 +204,18 @@ final class RoomPlanModel: NSObject, ObservableObject {
     private var graphNodeSceneNodes: [UUID: SCNNode] = [:]
     private var graphEdgeSceneNodes: [UUID: SCNNode] = [:]
     private var graphPreviewSceneNode: SCNNode?
+    private let speechGuidanceService = SpeechGuidanceService()
+    private let hapticGuidanceService = HapticGuidanceService()
+    private var localizationReadinessSnapshot = LocalizationReadinessSnapshot(
+        state: .notReady,
+        confidence: 0,
+        reason: "No current pose",
+        recommendedPrompt: "Not aligned yet. Scan walls and corners slowly."
+    )
+    private var plannedRoute: PlannedRoute?
+    private var orientationTarget: OrientationTarget?
+    private var orientationState = OrientationCoordinator.State(alignedSince: nil)
+    private var lastOrientationSnapshot: OrientationGuidanceSnapshot?
 
     override init() {
         super.init()
@@ -219,6 +238,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         loadNavGraphFromDisk()
         refreshAnchorActionAvailability()
         refreshGraphActionAvailability()
+        refreshLocalizationReadiness(trackingState: .notAvailable)
     }
 
     deinit {
@@ -258,12 +278,14 @@ final class RoomPlanModel: NSObject, ObservableObject {
         runtimeVisionKeyframeBuffer.removeAll()
         lastRuntimeVisionKeyframeCaptureAt = .distantPast
         resetAppLocalizationStateForNewAttempt()
+        resetNavigationPrepState()
     }
 
     func stopScan() {
         sceneView?.session.pause()
         isSessionRunning = false
         statusMessage = "Session paused"
+        stopOrientation()
     }
 
     func saveCurrentMap() {
@@ -525,6 +547,28 @@ final class RoomPlanModel: NSObject, ObservableObject {
         appLocalizationPromptText = presentation.appLocalizationPromptText
         arkitVsAppStateText = presentation.arkitVsAppStateText
         meshOverrideAppliedText = presentation.meshOverrideAppliedText
+    }
+
+    func refreshLocalizationReadiness(trackingState: ARCamera.TrackingState) {
+        localizationReadinessSnapshot = LocalizationReadinessCoordinator.snapshot(
+            inputs: .init(
+                appLocalizationState: appLocalizationState,
+                latestLocalizationConfidence: latestLocalizationConfidence,
+                acceptedMeshAlignmentConfidence: acceptedMeshAlignment?.confidence,
+                isPoseStable: isPoseStableForAnchorActions,
+                hasPose: currentPoseTransform != nil,
+                trackingState: trackingState
+            )
+        )
+        let confidencePercent = Int((max(0, min(1, localizationReadinessSnapshot.confidence)) * 100).rounded())
+        orientationReadinessText = "Orientation readiness: \(localizationReadinessSnapshot.state.displayLabel) (\(confidencePercent)%)"
+        if localizationReadinessSnapshot.state != .ready {
+            clearPlannedRoute()
+            if isOrientationActive {
+                stopOrientation()
+                orientationStatusText = "Orientation: paused"
+            }
+        }
     }
 
     func updateScanReadinessMetrics(with frame: ARFrame, currentTransform: simd_float4x4, currentYaw: Float) {
@@ -1538,6 +1582,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         if let error = result.errorMessage {
             errorMessage = error
         }
+        refreshDestinationSelectionValidity()
         refreshNavGraphStatus()
     }
 
@@ -1546,6 +1591,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
             navGraph = try Phase1MapStore.loadNavGraph() ?? .empty()
             hasSavedNavGraph = Phase1MapStore.navGraphExists()
             graphStatusMessage = hasSavedNavGraph ? "Graph loaded" : "No saved graph yet"
+            clearPlannedRoute()
             refreshNavGraphStatus()
             refreshGraphSceneOverlays()
         } catch {
@@ -1553,6 +1599,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
             hasSavedNavGraph = false
             graphStatusMessage = "Graph unavailable"
             errorMessage = "Graph load failed: \(error.localizedDescription)"
+            clearPlannedRoute()
             refreshNavGraphStatus()
         }
     }
@@ -1572,6 +1619,112 @@ final class RoomPlanModel: NSObject, ObservableObject {
         let validation = GraphManager.validate(graph: navGraph, anchors: anchors)
         let warningText = validation.warnings.isEmpty ? "ready" : validation.warnings.joined(separator: " | ")
         graphValidationText = "Graph: \(navGraph.nodes.count) waypoints, \(navGraph.edges.count) edges, \(validation.linkedAnchorCount) anchor links | \(warningText)"
+    }
+
+    var linkedDestinationAnchors: [SavedSemanticAnchor] {
+        anchors.filter { GraphManager.node(forLinkedAnchorID: $0.id, in: navGraph) != nil }
+    }
+
+    var canStartOrientation: Bool {
+        localizationReadinessSnapshot.state == .ready && orientationTarget != nil
+    }
+
+    func selectDestinationAnchor(_ anchorID: UUID?) {
+        selectedDestinationAnchorID = anchorID
+        clearPlannedRoute()
+        orientationStatusText = anchorID == nil ? "Orientation: destination not selected" : "Orientation: destination selected"
+    }
+
+    func planRouteToSelectedDestination() {
+        guard localizationReadinessSnapshot.state == .ready else {
+            plannedRouteSummaryText = "Route: unavailable"
+            graphStatusMessage = localizationReadinessSnapshot.recommendedPrompt
+            return
+        }
+        guard let destinationAnchorID = selectedDestinationAnchorID else {
+            plannedRouteSummaryText = "Route: unavailable"
+            graphStatusMessage = "Select a destination anchor"
+            return
+        }
+        guard let currentPoseTransform else {
+            plannedRouteSummaryText = "Route: unavailable"
+            graphStatusMessage = "No current pose yet"
+            return
+        }
+
+        switch NavigationPlanner.planRoute(
+            currentPose: currentPoseTransform,
+            destinationAnchorID: destinationAnchorID,
+            graph: navGraph,
+            anchors: anchors
+        ) {
+        case .success(let route):
+            plannedRoute = route
+            orientationTarget = OrientationCoordinator.makeTarget(route: route)
+            let destinationName = anchors.first(where: { $0.id == destinationAnchorID })?.name ?? "destination"
+            let distanceText = String(format: "%.1fm", route.totalDistanceMeters)
+            plannedRouteSummaryText = "Route: \(route.segments.count) segment(s), \(distanceText) to \(destinationName)"
+            graphStatusMessage = "Route planned"
+        case .failure(let error):
+            clearPlannedRoute()
+            graphStatusMessage = error.displayMessage
+        }
+    }
+
+    func startOrientationToRoute() {
+        guard localizationReadinessSnapshot.state == .ready else {
+            orientationStatusText = "Orientation: waiting for localization"
+            return
+        }
+        guard plannedRoute != nil, orientationTarget != nil else {
+            orientationStatusText = "Orientation: plan a route first"
+            return
+        }
+        isOrientationActive = true
+        orientationReadyToNavigate = false
+        orientationState = OrientationCoordinator.State(alignedSince: nil)
+        lastOrientationSnapshot = nil
+        orientationStatusText = "Orientation: active"
+    }
+
+    func stopOrientation() {
+        isOrientationActive = false
+        orientationReadyToNavigate = false
+        orientationState = OrientationCoordinator.State(alignedSince: nil)
+        lastOrientationSnapshot = nil
+        orientationDeltaText = "Orientation delta: n/a"
+        if plannedRoute == nil {
+            orientationStatusText = "Orientation: idle"
+        }
+        speechGuidanceService.stop()
+        hapticGuidanceService.stop()
+    }
+
+    func clearPlannedRoute() {
+        plannedRoute = nil
+        orientationTarget = nil
+        plannedRouteSummaryText = "Route: none"
+        orientationReadyToNavigate = false
+        if isOrientationActive {
+            stopOrientation()
+        } else {
+            orientationStatusText = "Orientation: idle"
+            orientationDeltaText = "Orientation delta: n/a"
+        }
+    }
+
+    func refreshDestinationSelectionValidity() {
+        guard let selectedDestinationAnchorID else { return }
+        if !linkedDestinationAnchors.contains(where: { $0.id == selectedDestinationAnchorID }) {
+            selectDestinationAnchor(nil)
+        }
+    }
+
+    func resetNavigationPrepState() {
+        selectedDestinationAnchorID = nil
+        clearPlannedRoute()
+        stopOrientation()
+        orientationReadinessText = "Orientation readiness: Not Ready"
     }
 
     func setWorkspaceMode(_ mode: WorkspaceMode) {
@@ -2198,6 +2351,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
     }
 
     private func updateGuidance(with frame: ARFrame) {
+        if isOrientationActive {
+            guidanceText = lastOrientationSnapshot?.promptText ?? "Choose a destination."
+            return
+        }
         if appLocalizationState == .conflict || appLocalizationState == .degraded {
             guidanceText = appLocalizationPromptText
             return
@@ -2236,6 +2393,49 @@ final class RoomPlanModel: NSObject, ObservableObject {
             yawSweepAccumulated = 0
         }
         guidanceText = decision.guidanceText
+    }
+
+    private func updateOrientationGuidance(currentYaw: Float, trackingState: ARCamera.TrackingState) {
+        refreshLocalizationReadiness(trackingState: trackingState)
+
+        guard isOrientationActive else {
+            if orientationTarget == nil {
+                orientationStatusText = selectedDestinationAnchorID == nil
+                    ? "Orientation: destination not selected"
+                    : "Orientation: route not planned"
+            }
+            return
+        }
+
+        let currentHeadingDegrees = currentYaw * 180 / .pi
+        let outcome = OrientationCoordinator.update(
+            state: orientationState,
+            inputs: .init(
+                readinessState: localizationReadinessSnapshot.state,
+                target: orientationTarget,
+                currentHeadingDegrees: currentHeadingDegrees,
+                isPoseStable: isPoseStableForAnchorActions,
+                now: Date()
+            )
+        )
+        orientationState = outcome.state
+        let snapshot = outcome.snapshot
+        lastOrientationSnapshot = snapshot
+        orientationDeltaText = String(
+            format: "Orientation delta: %.0f° (current %.0f°, target %.0f°)",
+            snapshot.deltaDegrees,
+            snapshot.currentHeadingDegrees,
+            snapshot.desiredHeadingDegrees
+        )
+        orientationStatusText = "Orientation: \(snapshot.promptText)"
+        orientationReadyToNavigate = snapshot.isAligned
+        guidanceText = snapshot.promptText
+        speechGuidanceService.speakIfNeeded(snapshot)
+        hapticGuidanceService.playIfNeeded(snapshot.hapticPattern)
+
+        if snapshot.isAligned {
+            isOrientationActive = false
+        }
     }
 
     private func currentRelocalizationGuidanceSnapshot() -> RelocalizationGuidanceSnapshot? {
@@ -2290,6 +2490,7 @@ extension RoomPlanModel: ARSessionDelegate, ARSCNViewDelegate {
             self.updateRelocalizationAttemptMetrics(with: frame, currentTransform: transform, currentYaw: yaw)
             self.updatePoseDiagnostics(with: frame, position: position, yaw: yaw)
             self.updateAppLocalizationState(with: frame, currentYaw: yaw)
+            self.updateOrientationGuidance(currentYaw: yaw, trackingState: frame.camera.trackingState)
             self.updateGuidance(with: frame)
             self.refreshAnchorTargetPreview()
             self.refreshAnchorActionAvailability()

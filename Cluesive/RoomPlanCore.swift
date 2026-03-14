@@ -175,6 +175,27 @@ struct GraphValidationResult {
     let duplicateEdgePairs: [(UUID, UUID)]
 }
 
+enum LocalizationReadinessState: String {
+    case notReady
+    case recovering
+    case ready
+
+    var displayLabel: String {
+        switch self {
+        case .notReady: return "Not Ready"
+        case .recovering: return "Recovering"
+        case .ready: return "Ready"
+        }
+    }
+}
+
+struct LocalizationReadinessSnapshot {
+    let state: LocalizationReadinessState
+    let confidence: Float
+    let reason: String?
+    let recommendedPrompt: String
+}
+
 struct AnchorPingResult {
     let anchorID: UUID
     let anchorName: String
@@ -467,6 +488,80 @@ struct MeshFallbackState {
     var startedAt: Date
     var progressText: String
     var result: MeshRelocalizationResult?
+}
+
+struct RouteSegment: Equatable {
+    let fromNodeID: UUID
+    let toNodeID: UUID
+    let startPosition: SIMD3<Float>
+    let endPosition: SIMD3<Float>
+    let headingDegrees: Float
+    let distanceMeters: Float
+}
+
+struct PlannedRoute: Equatable {
+    let destinationAnchorID: UUID
+    let destinationNodeID: UUID
+    let startNodeID: UUID
+    let nodePath: [UUID]
+    let segments: [RouteSegment]
+    let totalDistanceMeters: Float
+}
+
+enum RoutePlanningError: Error, Equatable {
+    case destinationAnchorNotLinked
+    case graphInvalid
+    case startPoseNotNearGraph
+    case noPath
+
+    var displayMessage: String {
+        switch self {
+        case .destinationAnchorNotLinked:
+            return "Destination anchor is not linked to the graph."
+        case .graphInvalid:
+            return "Navigation graph is incomplete or disconnected."
+        case .startPoseNotNearGraph:
+            return "Current position is too far from the graph start."
+        case .noPath:
+            return "No path exists to the selected destination."
+        }
+    }
+}
+
+enum OrientationGuidanceState: String {
+    case idle
+    case waitingForLocalization
+    case waitingForRoute
+    case unstableHeading
+    case turnLeft
+    case turnRight
+    case nearlyAligned
+    case aligned
+}
+
+enum OrientationHapticPattern: String, Equatable {
+    case none
+    case slow
+    case medium
+    case fast
+    case success
+}
+
+struct OrientationTarget: Equatable {
+    let route: PlannedRoute
+    let targetSegmentIndex: Int
+    let desiredHeadingDegrees: Float
+    let toleranceDegrees: Float
+}
+
+struct OrientationGuidanceSnapshot: Equatable {
+    let state: OrientationGuidanceState
+    let currentHeadingDegrees: Float
+    let desiredHeadingDegrees: Float
+    let deltaDegrees: Float
+    let promptText: String
+    let hapticPattern: OrientationHapticPattern
+    let isAligned: Bool
 }
 
 enum AppLocalizationState: String {
