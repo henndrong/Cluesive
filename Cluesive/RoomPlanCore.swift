@@ -20,6 +20,22 @@ enum LocalizationState: String {
     }
 }
 
+enum WorkspaceMode: String, CaseIterable, Identifiable {
+    case scan
+    case anchors
+    case graph
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .scan: return "Scan"
+        case .anchors: return "Anchors"
+        case .graph: return "Graph"
+        }
+    }
+}
+
 enum AnchorType: String, Codable, CaseIterable, Identifiable {
     case door
     case roomEntrance
@@ -101,6 +117,62 @@ struct SavedSemanticAnchor: Codable, Identifiable, Equatable {
         self.placementMode = placementMode
         self.sourceNote = sourceNote
     }
+}
+
+enum GraphNodeType: String, Codable {
+    case manualWaypoint
+    case anchorLinked
+}
+
+struct NavGraphNode: Codable, Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var position: SIMD3<Float>
+    var nodeType: GraphNodeType
+    var linkedAnchorID: UUID?
+    var createdAt: Date
+}
+
+struct NavGraphEdge: Codable, Identifiable, Equatable {
+    let id: UUID
+    let fromNodeID: UUID
+    let toNodeID: UUID
+    var distanceMeters: Float
+}
+
+struct NavGraphArtifact: Codable, Equatable {
+    let mapName: String
+    let createdAt: Date
+    var updatedAt: Date
+    let version: Int
+    var nodes: [NavGraphNode]
+    var edges: [NavGraphEdge]
+
+    static func empty(mapName: String = Phase1MapStore.mapName) -> NavGraphArtifact {
+        let now = Date()
+        return NavGraphArtifact(
+            mapName: mapName,
+            createdAt: now,
+            updatedAt: now,
+            version: 1,
+            nodes: [],
+            edges: []
+        )
+    }
+}
+
+struct GraphPlacementPreview {
+    let isValid: Bool
+    let worldPosition: SIMD3<Float>?
+    let reason: String?
+}
+
+struct GraphValidationResult {
+    let isValid: Bool
+    let warnings: [String]
+    let linkedAnchorCount: Int
+    let disconnectedNodeIDs: [UUID]
+    let duplicateEdgePairs: [(UUID, UUID)]
 }
 
 struct AnchorPingResult {
@@ -612,6 +684,10 @@ enum Phase1MapStore {
         bundleDirectory.appendingPathComponent("anchors.json")
     }
 
+    private static var navGraphURL: URL {
+        bundleDirectory.appendingPathComponent("navgraph.json")
+    }
+
     private static var roomSignatureURL: URL {
         bundleDirectory.appendingPathComponent("roomSignature.json")
     }
@@ -656,6 +732,9 @@ enum Phase1MapStore {
         if !fm.fileExists(atPath: anchorsURL.path) {
             try Data("[]".utf8).write(to: anchorsURL, options: .atomic)
         }
+        if !fm.fileExists(atPath: navGraphURL.path) {
+            try JSONEncoder.pretty.encode(NavGraphArtifact.empty()).write(to: navGraphURL, options: .atomic)
+        }
         return metadata
     }
 
@@ -685,6 +764,24 @@ enum Phase1MapStore {
         try fm.createDirectory(at: bundleDirectory, withIntermediateDirectories: true, attributes: nil)
         let data = try JSONEncoder.pretty.encode(anchors)
         try data.write(to: anchorsURL, options: .atomic)
+    }
+
+    static func navGraphExists() -> Bool {
+        FileManager.default.fileExists(atPath: navGraphURL.path)
+    }
+
+    static func saveNavGraph(_ graph: NavGraphArtifact) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: bundleDirectory, withIntermediateDirectories: true, attributes: nil)
+        let data = try JSONEncoder.pretty.encode(graph)
+        try data.write(to: navGraphURL, options: .atomic)
+    }
+
+    static func loadNavGraph() throws -> NavGraphArtifact? {
+        guard FileManager.default.fileExists(atPath: navGraphURL.path) else { return nil }
+        let data = try Data(contentsOf: navGraphURL)
+        if data.isEmpty { return NavGraphArtifact.empty() }
+        return try JSONDecoder.iso8601.decode(NavGraphArtifact.self, from: data)
     }
 
     static func roomSignatureExists() -> Bool {

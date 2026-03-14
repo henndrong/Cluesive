@@ -105,6 +105,38 @@ final class RoomPlanModelLocalizationTests: XCTestCase {
         XCTAssertEqual(model.debugCachedSavedMeshPointsCount, 0)
     }
 
+    func testGraphLoadIsSafeWhenNoFileExists() {
+        let model = RoomPlanModel()
+        model.loadNavGraphFromDisk()
+
+        XCTAssertTrue(model.navGraph.nodes.isEmpty)
+        XCTAssertTrue(model.navGraph.edges.isEmpty)
+    }
+
+    func testEnteringAndLeavingGraphModeResetsSelection() {
+        let model = RoomPlanModel()
+        model.navGraph = seededGraph()
+        let selectedID = model.navGraph.nodes[0].id
+
+        model.setWorkspaceMode(.graph)
+        model.selectWaypoint(selectedID)
+        XCTAssertEqual(model.debugSelectedGraphNodeID, selectedID)
+
+        model.setWorkspaceMode(.scan)
+        XCTAssertNil(model.debugSelectedGraphNodeID)
+        XCTAssertEqual(model.debugWorkspaceMode, .scan)
+    }
+
+    func testSavingGraphDoesNotEraseGraph() {
+        let model = RoomPlanModel()
+        model.navGraph = seededGraph()
+
+        model.saveNavGraphToDisk()
+        model.loadNavGraphFromDisk()
+
+        XCTAssertEqual(model.navGraph.nodes.count, 2)
+    }
+
     private func makeAcceptance(confidence: Float) -> MeshAlignmentAcceptance {
         MeshAlignmentAcceptance(
             mapFromSessionTransform: matrix_identity_float4x4,
@@ -142,6 +174,34 @@ final class RoomPlanModelLocalizationTests: XCTestCase {
             meshAnchors: [record],
             descriptor: descriptor,
             version: 1
+        )
+    }
+
+    private func seededGraph() -> NavGraphArtifact {
+        NavGraphArtifact(
+            mapName: "test",
+            createdAt: Date(),
+            updatedAt: Date(),
+            version: 1,
+            nodes: [
+                NavGraphNode(
+                    id: UUID(),
+                    name: "Waypoint 1",
+                    position: SIMD3<Float>(0, 0, 0),
+                    nodeType: .manualWaypoint,
+                    linkedAnchorID: nil,
+                    createdAt: Date()
+                ),
+                NavGraphNode(
+                    id: UUID(),
+                    name: "Waypoint 2",
+                    position: SIMD3<Float>(1, 0, 0),
+                    nodeType: .manualWaypoint,
+                    linkedAnchorID: nil,
+                    createdAt: Date()
+                )
+            ],
+            edges: []
         )
     }
 }

@@ -14,8 +14,12 @@ import UIKit
 @MainActor
 final class RoomPlanModel: NSObject, ObservableObject {
     private let anchorConfidenceThreshold: Float = 0.70
+    private let graphLinkDistanceThresholdMeters: Float = 1.0
+    private let graphWaypointSelectionDistanceMeters: Float = 0.35
+    private let minimumEdgeDistanceMeters: Float = 0.25
 
     @Published var isSessionRunning = false
+    @Published var workspaceMode: WorkspaceMode = .scan
     @Published var trackingStateText = "Not started"
     @Published var mappingStatusText = "n/a"
     @Published var guidanceText = "Start a scan and slowly move around walls/furniture."
@@ -85,6 +89,17 @@ final class RoomPlanModel: NSObject, ObservableObject {
     @Published var worldOriginShiftDebugText = "World Origin Shift Debug: n/a"
     @Published var localizationEventCountText = "Localization Events: 0"
     @Published var localizationLastEventText = "Last Localization Event: n/a"
+    @Published var navGraph: NavGraphArtifact = .empty()
+    @Published var selectedGraphNodeID: UUID?
+    @Published var selectedGraphEdgeID: UUID?
+    @Published var graphDraftName = ""
+    @Published var graphPlacementAllowed = false
+    @Published var graphPlacementBlockReason: String?
+    @Published var graphTargetPreviewText: String?
+    @Published var graphStatusMessage: String?
+    @Published var graphValidationText = "Graph: 0 nodes, 0 edges"
+    @Published var graphAnchorLinkText: String?
+    @Published var hasSavedNavGraph = false
     @Published var meshOnlyTestModeEnabled = false {
         didSet {
             if meshOnlyTestModeEnabled {
@@ -178,6 +193,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
     private var hasUserConfirmedMediumFallback = false
     private var cachedSavedMeshPoints: [SIMD3<Float>] = []
     private var memoryWarningObserver: NSObjectProtocol?
+    private var latestGraphPlacementPreview = GraphPlacementPreview(isValid: false, worldPosition: nil, reason: "Aim at floor to place waypoint")
+    private var graphNodeSceneNodes: [UUID: SCNNode] = [:]
+    private var graphEdgeSceneNodes: [UUID: SCNNode] = [:]
+    private var graphPreviewSceneNode: SCNNode?
 
     override init() {
         super.init()
@@ -197,7 +216,9 @@ final class RoomPlanModel: NSObject, ObservableObject {
         refreshRoomSignatureStatus()
         refreshMeshArtifactStatus()
         refreshLocalizationEventLogStatus()
+        loadNavGraphFromDisk()
         refreshAnchorActionAvailability()
+        refreshGraphActionAvailability()
     }
 
     deinit {
@@ -217,6 +238,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
         refreshRoomSignatureStatus()
         refreshMeshArtifactStatus()
         refreshLocalizationEventLogStatus()
+        loadNavGraphFromDisk()
+        refreshGraphSceneOverlays()
     }
 
     func startFreshScan() {
@@ -274,6 +297,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
                     self.hasSavedMap = true
                     self.lastSavedText = "Saved \(metadata.updatedAt.formatted(date: .abbreviated, time: .shortened))"
                     self.loadAnchorsFromDisk()
+                    self.loadNavGraphFromDisk()
                     self.refreshRoomSignatureStatus()
                     self.refreshMeshArtifactStatus()
                     if let warning = self.saveMapWarningText {
@@ -298,8 +322,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
             savedMeshArtifact = try Phase1MapStore.loadMeshArtifact()
             savedStructureSignatureArtifact = try Phase1MapStore.loadStructureSignature()
             savedVisionIndexArtifact = try Phase1MapStore.loadVisionIndex()
+            navGraph = try Phase1MapStore.loadNavGraph() ?? .empty()
             refreshRoomSignatureStatus()
             refreshMeshArtifactStatus()
+            refreshNavGraphStatus()
             awaitingRelocalization = true
             sawRelocalizingState = false
             stableNormalFramesAfterLoad = 0
@@ -316,6 +342,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
             runSession(initialWorldMap: meshOnlyTestModeEnabled ? nil : worldMap)
             refreshCachedSavedMeshPoints()
             beginRelocalizationAttempt()
+            refreshGraphSceneOverlays()
         } catch {
             errorMessage = "Load failed: \(error.localizedDescription)"
         }
@@ -1465,6 +1492,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
     var debugMeshFallbackActive: Bool { meshFallbackState.active }
     var debugRelocalizationAttemptMode: RelocalizationAttemptMode? { relocalizationAttemptState?.mode }
     var debugCachedSavedMeshPointsCount: Int { cachedSavedMeshPoints.count }
+    var debugSelectedGraphNodeID: UUID? { selectedGraphNodeID }
+    var debugWorkspaceMode: WorkspaceMode { workspaceMode }
 
     func debugSetAwaitingRelocalizationForTesting(_ value: Bool) {
         awaitingRelocalization = value
@@ -1509,17 +1538,69 @@ final class RoomPlanModel: NSObject, ObservableObject {
         if let error = result.errorMessage {
             errorMessage = error
         }
+        refreshNavGraphStatus()
+    }
+
+    func loadNavGraphFromDisk() {
+        do {
+            navGraph = try Phase1MapStore.loadNavGraph() ?? .empty()
+            hasSavedNavGraph = Phase1MapStore.navGraphExists()
+            graphStatusMessage = hasSavedNavGraph ? "Graph loaded" : "No saved graph yet"
+            refreshNavGraphStatus()
+            refreshGraphSceneOverlays()
+        } catch {
+            navGraph = .empty()
+            hasSavedNavGraph = false
+            graphStatusMessage = "Graph unavailable"
+            errorMessage = "Graph load failed: \(error.localizedDescription)"
+            refreshNavGraphStatus()
+        }
+    }
+
+    func saveNavGraphToDisk() {
+        do {
+            try Phase1MapStore.saveNavGraph(navGraph)
+            hasSavedNavGraph = true
+            graphStatusMessage = "Graph saved"
+            refreshNavGraphStatus()
+        } catch {
+            errorMessage = "Graph save failed: \(error.localizedDescription)"
+        }
+    }
+
+    func refreshNavGraphStatus() {
+        let validation = GraphManager.validate(graph: navGraph, anchors: anchors)
+        let warningText = validation.warnings.isEmpty ? "ready" : validation.warnings.joined(separator: " | ")
+        graphValidationText = "Graph: \(navGraph.nodes.count) waypoints, \(navGraph.edges.count) edges, \(validation.linkedAnchorCount) anchor links | \(warningText)"
+    }
+
+    func setWorkspaceMode(_ mode: WorkspaceMode) {
+        workspaceMode = mode
+        isAnchorModePresented = (mode == .anchors)
+        if mode != .anchors {
+            anchorTargetPreviewText = nil
+        }
+        if mode != .graph {
+            selectedGraphNodeID = nil
+            selectedGraphEdgeID = nil
+            graphDraftName = ""
+            graphAnchorLinkText = nil
+        }
+        refreshAnchorTargetPreview()
+        refreshAnchorActionAvailability()
+        refreshGraphPlacementPreview()
+        refreshGraphActionAvailability()
+        refreshGraphSceneOverlays()
     }
 
     func enterAnchorMode() {
         applyAnchorModePresentationState(AnchorManager.enterAnchorModePresentationState())
-        refreshAnchorTargetPreview()
-        refreshAnchorActionAvailability()
+        setWorkspaceMode(.anchors)
     }
 
     func exitAnchorMode() {
         applyAnchorModePresentationState(AnchorManager.exitAnchorModePresentationState(currentPlacementMode: anchorPlacementMode))
-        refreshAnchorActionAvailability()
+        setWorkspaceMode(.scan)
     }
 
     func addAnchorUsingCurrentPlacementMode(type: AnchorType, name: String) {
@@ -1605,11 +1686,132 @@ final class RoomPlanModel: NSObject, ObservableObject {
         anchorOperationMessage = "Pinged \(ping.anchorName)"
     }
 
+    func addWaypointAtAimPoint() {
+        refreshGraphPlacementPreview()
+        refreshGraphActionAvailability()
+        guard graphPlacementAllowed, let position = latestGraphPlacementPreview.worldPosition else {
+            graphStatusMessage = graphPlacementBlockReason ?? "Aim at the floor to place a waypoint"
+            return
+        }
+        if navGraph.nodes.contains(where: { GraphManager.edgeDistance(from: $0.position, to: position) < minimumEdgeDistanceMeters }) {
+            graphStatusMessage = "Waypoint too close to an existing waypoint"
+            return
+        }
+        navGraph = GraphManager.createWaypoint(in: navGraph, position: position)
+        if let newNode = navGraph.nodes.last {
+            selectedGraphNodeID = newNode.id
+            graphDraftName = newNode.name
+            graphStatusMessage = "Added \(newNode.name)"
+        }
+        refreshNavGraphStatus()
+        refreshGraphSceneOverlays()
+    }
+
+    func renameSelectedWaypoint(to newName: String) {
+        guard let selectedGraphNodeID else { return }
+        let updated = GraphManager.renameNode(in: navGraph, nodeID: selectedGraphNodeID, newName: newName)
+        guard updated != navGraph else {
+            graphStatusMessage = "Waypoint name cannot be empty"
+            return
+        }
+        navGraph = updated
+        graphDraftName = navGraph.nodes.first(where: { $0.id == selectedGraphNodeID })?.name ?? ""
+        graphStatusMessage = "Waypoint renamed"
+        refreshNavGraphStatus()
+        refreshGraphSceneOverlays()
+    }
+
+    func deleteSelectedWaypoint() {
+        guard let selectedGraphNodeID else { return }
+        navGraph = GraphManager.deleteNode(in: navGraph, nodeID: selectedGraphNodeID)
+        self.selectedGraphNodeID = nil
+        selectedGraphEdgeID = nil
+        graphDraftName = ""
+        graphStatusMessage = "Waypoint deleted"
+        refreshNavGraphStatus()
+        refreshGraphSceneOverlays()
+    }
+
+    func selectWaypoint(_ nodeID: UUID) {
+        selectedGraphNodeID = nodeID
+        selectedGraphEdgeID = nil
+        graphDraftName = navGraph.nodes.first(where: { $0.id == nodeID })?.name ?? ""
+        if let node = navGraph.nodes.first(where: { $0.id == nodeID }) {
+            graphAnchorLinkText = node.linkedAnchorID.flatMap { anchorID in
+                anchors.first(where: { $0.id == anchorID })?.name
+            }
+        }
+        refreshGraphSceneOverlays()
+    }
+
+    func connectSelectedWaypoint(to nodeID: UUID) {
+        guard let selectedGraphNodeID else { return }
+        guard let source = navGraph.nodes.first(where: { $0.id == selectedGraphNodeID }),
+              let destination = navGraph.nodes.first(where: { $0.id == nodeID }) else {
+            graphStatusMessage = "Select two valid waypoints"
+            return
+        }
+        let distance = GraphManager.edgeDistance(from: source.position, to: destination.position)
+        guard distance >= minimumEdgeDistanceMeters else {
+            graphStatusMessage = "Waypoints are too close to connect"
+            return
+        }
+        let result = GraphManager.createEdge(in: navGraph, from: selectedGraphNodeID, to: nodeID)
+        navGraph = result.graph
+        graphStatusMessage = result.error ?? "Connected waypoints"
+        refreshNavGraphStatus()
+        refreshGraphSceneOverlays()
+    }
+
+    func deleteSelectedEdge() {
+        guard let selectedGraphEdgeID else { return }
+        navGraph = GraphManager.deleteEdge(in: navGraph, edgeID: selectedGraphEdgeID)
+        self.selectedGraphEdgeID = nil
+        graphStatusMessage = "Edge removed"
+        refreshNavGraphStatus()
+        refreshGraphSceneOverlays()
+    }
+
+    func linkSelectedWaypointToAnchor(_ anchorID: UUID?) {
+        guard let selectedGraphNodeID else { return }
+        navGraph = GraphManager.linkAnchor(in: navGraph, nodeID: selectedGraphNodeID, anchorID: anchorID)
+        if let anchorID {
+            graphAnchorLinkText = anchors.first(where: { $0.id == anchorID })?.name
+            graphStatusMessage = "Anchor linked"
+        } else {
+            graphAnchorLinkText = nil
+            graphStatusMessage = "Anchor link cleared"
+        }
+        refreshNavGraphStatus()
+        refreshGraphSceneOverlays()
+    }
+
+    func autoLinkNearestWaypointToAnchor(anchorID: UUID) {
+        guard let anchor = anchors.first(where: { $0.id == anchorID }),
+              let node = GraphManager.nearestWaypoint(to: anchor, in: navGraph, thresholdMeters: graphLinkDistanceThresholdMeters) else {
+            graphStatusMessage = "No waypoint close enough to link"
+            return
+        }
+        selectWaypoint(node.id)
+        linkSelectedWaypointToAnchor(anchorID)
+    }
+
+    func validateNavGraph() {
+        let validation = GraphManager.validate(graph: navGraph, anchors: anchors)
+        graphStatusMessage = validation.isValid ? "Graph valid for routing" : validation.warnings.joined(separator: " | ")
+        refreshNavGraphStatus()
+    }
+
     func refreshAnchorActionAvailability() {
         let eligibility = anchorActionEligibility(for: anchorPlacementMode)
         anchorPlacementAllowed = eligibility.allowed
         anchorPlacementBlockReason = eligibility.reason
         anchorModeStatusText = AnchorManager.anchorModeStatusText(for: anchorPlacementMode, eligibility: eligibility)
+    }
+
+    func refreshGraphActionAvailability() {
+        graphPlacementAllowed = workspaceMode == .graph && latestGraphPlacementPreview.isValid
+        graphPlacementBlockReason = graphPlacementAllowed ? nil : latestGraphPlacementPreview.reason
     }
 
     func currentPoseTransformIfEligibleForAnchor() -> simd_float4x4? {
@@ -1687,6 +1889,53 @@ final class RoomPlanModel: NSObject, ObservableObject {
         } else {
             applyAnchorTargetPreviewState(AnchorManager.unavailableRaycastPreviewState(reason: "No target surface in center view"))
         }
+    }
+
+    func refreshGraphPlacementPreview() {
+        guard workspaceMode == .graph else {
+            latestGraphPlacementPreview = GraphPlacementPreview(isValid: false, worldPosition: nil, reason: "Switch to Graph mode to place waypoints")
+            graphTargetPreviewText = nil
+            refreshGraphActionAvailability()
+            return
+        }
+
+        let baseEligibility = validateAnchorPlacementEligibility()
+        guard baseEligibility.allowed else {
+            latestGraphPlacementPreview = GraphPlacementPreview(isValid: false, worldPosition: nil, reason: baseEligibility.reason ?? "Localization not ready")
+            graphTargetPreviewText = baseEligibility.reason ?? "Localization not ready"
+            refreshGraphActionAvailability()
+            refreshGraphSceneOverlays()
+            return
+        }
+
+        guard let view = sceneView else {
+            latestGraphPlacementPreview = GraphPlacementPreview(isValid: false, worldPosition: nil, reason: "AR view not ready")
+            graphTargetPreviewText = "AR view not ready"
+            refreshGraphActionAvailability()
+            refreshGraphSceneOverlays()
+            return
+        }
+
+        let center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+        guard let query = view.raycastQuery(from: center, allowing: .estimatedPlane, alignment: .any),
+              let hit = view.session.raycast(query).first else {
+            latestGraphPlacementPreview = GraphPlacementPreview(isValid: false, worldPosition: nil, reason: "Aim at floor to place waypoint")
+            graphTargetPreviewText = "Aim at floor to place waypoint"
+            refreshGraphActionAvailability()
+            refreshGraphSceneOverlays()
+            return
+        }
+
+        let position = hit.worldTransform.translation
+        if navGraph.nodes.contains(where: { GraphManager.edgeDistance(from: $0.position, to: position) < minimumEdgeDistanceMeters }) {
+            latestGraphPlacementPreview = GraphPlacementPreview(isValid: false, worldPosition: nil, reason: "Waypoint too close to existing waypoint")
+            graphTargetPreviewText = "Waypoint too close to existing waypoint"
+        } else {
+            latestGraphPlacementPreview = GraphPlacementPreview(isValid: true, worldPosition: position, reason: nil)
+            graphTargetPreviewText = String(format: "Aim target: x %.2f z %.2f", position.x, position.z)
+        }
+        refreshGraphActionAvailability()
+        refreshGraphSceneOverlays()
     }
 
     private func applyAnchorTargetPreviewState(_ state: AnchorManager.TargetPreviewState) {
@@ -1777,6 +2026,93 @@ final class RoomPlanModel: NSObject, ObservableObject {
         if !keepSavedMeshCache {
             cachedSavedMeshPoints.removeAll()
         }
+    }
+
+    func clearGraphSceneOverlays() {
+        graphNodeSceneNodes.values.forEach { $0.removeFromParentNode() }
+        graphEdgeSceneNodes.values.forEach { $0.removeFromParentNode() }
+        graphPreviewSceneNode?.removeFromParentNode()
+        graphNodeSceneNodes.removeAll()
+        graphEdgeSceneNodes.removeAll()
+        graphPreviewSceneNode = nil
+    }
+
+    func refreshGraphSceneOverlays() {
+        guard let rootNode = sceneView?.scene.rootNode else { return }
+        guard workspaceMode == .graph else {
+            clearGraphSceneOverlays()
+            return
+        }
+
+        let nodeIDs = Set(navGraph.nodes.map(\.id))
+        for (id, node) in graphNodeSceneNodes where !nodeIDs.contains(id) {
+            node.removeFromParentNode()
+            graphNodeSceneNodes[id] = nil
+        }
+
+        let edgeIDs = Set(navGraph.edges.map(\.id))
+        for (id, node) in graphEdgeSceneNodes where !edgeIDs.contains(id) {
+            node.removeFromParentNode()
+            graphEdgeSceneNodes[id] = nil
+        }
+
+        for node in navGraph.nodes {
+            let sceneNode = graphNodeSceneNodes[node.id] ?? {
+                let newNode = SCNNode()
+                rootNode.addChildNode(newNode)
+                graphNodeSceneNodes[node.id] = newNode
+                return newNode
+            }()
+            sceneNode.geometry = SCNSphere(radius: selectedGraphNodeID == node.id ? 0.07 : 0.05)
+            sceneNode.geometry?.firstMaterial?.diffuse.contents = node.linkedAnchorID == nil ? UIColor.systemBlue : UIColor.systemOrange
+            sceneNode.position = SCNVector3(node.position.x, node.position.y + 0.04, node.position.z)
+            sceneNode.name = "graph-node-\(node.id.uuidString)"
+        }
+
+        for edge in navGraph.edges {
+            guard let from = navGraph.nodes.first(where: { $0.id == edge.fromNodeID }),
+                  let to = navGraph.nodes.first(where: { $0.id == edge.toNodeID }) else { continue }
+            let lineNode = graphEdgeSceneNodes[edge.id] ?? {
+                let newNode = SCNNode()
+                rootNode.addChildNode(newNode)
+                graphEdgeSceneNodes[edge.id] = newNode
+                return newNode
+            }()
+            configureGraphEdgeNode(lineNode, from: from.position, to: to.position, isSelected: selectedGraphEdgeID == edge.id)
+        }
+
+        graphPreviewSceneNode?.removeFromParentNode()
+        graphPreviewSceneNode = nil
+        if let previewPosition = latestGraphPlacementPreview.worldPosition {
+            let preview = SCNNode(geometry: SCNSphere(radius: 0.035))
+            preview.geometry?.firstMaterial?.diffuse.contents = latestGraphPlacementPreview.isValid ? UIColor.systemGreen : UIColor.systemRed
+            preview.position = SCNVector3(previewPosition.x, previewPosition.y + 0.03, previewPosition.z)
+            rootNode.addChildNode(preview)
+            graphPreviewSceneNode = preview
+        }
+    }
+
+    private func configureGraphEdgeNode(_ node: SCNNode, from: SIMD3<Float>, to: SIMD3<Float>, isSelected: Bool) {
+        let start = SCNVector3(from.x, from.y + 0.03, from.z)
+        let end = SCNVector3(to.x, to.y + 0.03, to.z)
+        let vector = SCNVector3(end.x - start.x, end.y - start.y, end.z - start.z)
+        let length = sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z)
+        let cylinder = SCNCylinder(radius: isSelected ? 0.018 : 0.012, height: CGFloat(length))
+        cylinder.firstMaterial?.diffuse.contents = isSelected ? UIColor.systemYellow : UIColor.systemTeal
+        node.geometry = cylinder
+        node.position = SCNVector3((start.x + end.x) / 2, (start.y + end.y) / 2, (start.z + end.z) / 2)
+        node.eulerAngles = lineEulerAngles(from: start, to: end)
+        node.name = "graph-edge"
+    }
+
+    private func lineEulerAngles(from start: SCNVector3, to end: SCNVector3) -> SCNVector3 {
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let dz = end.z - start.z
+        let horizontal = sqrt(dx * dx + dz * dz)
+        let pitch = atan2(horizontal, dy) - (.pi / 2)
+        let yaw = atan2(dx, dz)
+        return SCNVector3(pitch, yaw, 0)
     }
 
     func handleMemoryWarning() {
@@ -1957,6 +2293,8 @@ extension RoomPlanModel: ARSessionDelegate, ARSCNViewDelegate {
             self.updateGuidance(with: frame)
             self.refreshAnchorTargetPreview()
             self.refreshAnchorActionAvailability()
+            self.refreshGraphPlacementPreview()
+            self.refreshGraphActionAvailability()
         }
     }
 

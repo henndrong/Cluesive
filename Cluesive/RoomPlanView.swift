@@ -2,7 +2,7 @@
 //  RoomPlanView.swift
 //  Cluesive
 //
-//  UI for LiDAR scanning, relocalization debug, and anchor tools.
+//  Mode-based UI for scanning, anchors, and manual graph editing.
 //
 
 import SwiftUI
@@ -24,32 +24,36 @@ struct RoomPlanView: View {
     @StateObject private var model = RoomPlanModel()
     @State private var renamingAnchorID: UUID?
     @State private var renameDraft = ""
-    @State private var showAnchorModeAdvancedStatus = false
-    @State private var showRelocalizationDetails = false
-    @State private var showReadinessDetails = false
-    @State private var showRawDebugDetails = false
-    @State private var showScanFallbackStorageDetails = false
+    @State private var showScanDebug = false
+
+    private var workspaceBinding: Binding<WorkspaceMode> {
+        Binding(
+            get: { model.workspaceMode },
+            set: { model.setWorkspaceMode($0) }
+        )
+    }
 
     var body: some View {
         ZStack {
             RoomCaptureContainerView(model: model)
                 .ignoresSafeArea()
 
-            if model.isAnchorModePresented {
-                anchorReticleOverlay
+            if model.workspaceMode == .anchors || model.workspaceMode == .graph {
+                centerReticleOverlay
                     .allowsHitTesting(false)
             }
 
             VStack(spacing: 12) {
-                topStatusPanel
+                compactStatusPanel
                 Spacer()
-                bottomControlPanel
+                activeWorkspacePanel
             }
             .padding()
         }
         .onAppear {
             model.refreshSavedMapState()
             model.loadAnchorsFromDisk()
+            model.loadNavGraphFromDisk()
             model.refreshRoomSignatureStatus()
             model.refreshMeshArtifactStatus()
             model.refreshLocalizationEventLogStatus()
@@ -66,7 +70,7 @@ struct RoomPlanView: View {
         }
     }
 
-    private var topStatusPanel: some View {
+    private var compactStatusPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let error = model.errorMessage {
                 Text(error)
@@ -76,232 +80,18 @@ struct RoomPlanView: View {
                     .foregroundStyle(.green)
             }
 
-            if model.isAnchorModePresented {
-                Text("Anchor Mode")
-                    .font(.caption.weight(.semibold))
-                Text("Localization State: \(model.localizationStateText)")
-                Text(model.appLocalizationStateText)
-                Text(model.appLocalizationSourceText)
-                Text(model.meshOverrideAppliedText)
-                Text("Reloc: \(model.relocalizationText)")
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(model.appLocalizationConfidenceText)
-                Text(model.appLocalizationPromptText)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(model.localizationConfidenceText)
-                Text(model.poseStabilityText)
-                Text("Target: \(model.anchorTargetPreviewText ?? "n/a")")
-                    .fixedSize(horizontal: false, vertical: true)
-                if let reason = model.anchorPlacementBlockReason, !model.anchorPlacementAllowed {
-                    Text(reason)
-                        .foregroundStyle(.yellow)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let ping = model.anchorPingText {
-                    Text("Ping: \(ping)")
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let anchorOp = model.anchorOperationMessage {
-                    Text("Anchors: \(anchorOp)")
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let conflict = model.localizationConflictText {
-                    Text(conflict)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                DisclosureGroup("Advanced Relocalization / Fallback", isExpanded: $showAnchorModeAdvancedStatus) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(model.arkitVsAppStateText)
-                        Text(model.meshOverrideStatusText)
-                        Text(model.worldOriginShiftDebugText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(model.localizationEventCountText)
-                        Text(model.localizationLastEventText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(model.relocalizationAttemptModeText)
-                        Text(model.relocalizationAttemptProgressText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(model.meshFallbackText)
-                        Text(model.meshFallbackPhaseText)
-                        Text(model.meshFallbackConfidenceText)
-                        Text(model.fallbackModeText)
-                        Text(model.fallbackConfidenceBandText)
-                        Text(model.fallbackLatencyMsText)
-                        Text(model.meshPoseSeedText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if model.fallbackNeedsConfirmation {
-                            Text(model.fallbackConfirmationPromptText ?? "Provisional alignment found.")
-                                .foregroundStyle(.yellow)
-                                .fixedSize(horizontal: false, vertical: true)
-                            HStack(spacing: 8) {
-                                Button("Confirm Fallback") {
-                                    model.confirmFallbackAlignment()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                Button("Reject") {
-                                    model.rejectFallbackAlignment()
-                                }
-                                .buttonStyle(.bordered)
-                            }
-                        }
-                        if let meshPrompt = model.meshFallbackPromptText {
-                            Text("Mesh fallback: \(meshPrompt)")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Text(model.fallbackRelocalizationText)
-                        Text(model.fallbackRelocalizationModeText)
-                        Text(model.fallbackRelocalizationConfidenceText)
-                        if let fallbackPrompt = model.fallbackRelocalizationPromptText {
-                            Text("Fallback prompt: \(fallbackPrompt)")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if let fallback = model.relocalizationFallbackPromptText {
-                            Text("Fallback: \(fallback)")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .padding(.top, 4)
-                }
-            } else {
-                Text("Tracking: \(model.trackingStateText)")
-                Text("Mapping: \(model.mappingStatusText)")
-                Text("Localization State: \(model.localizationStateText)")
-                Text(model.appLocalizationStateText)
-                Text(model.appLocalizationSourceText)
-                Text(model.meshOverrideAppliedText)
-                Text("Reloc: \(model.relocalizationText)")
-                Text(model.appLocalizationConfidenceText)
-                Text(model.appLocalizationPromptText)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("Guidance: \(model.guidanceText)")
-                    .fixedSize(horizontal: false, vertical: true)
+            Text("Mode: \(model.workspaceMode.displayName)")
+            Text("Tracking: \(model.trackingStateText)")
+            Text(model.appLocalizationStateText)
+            Text(model.appLocalizationPromptText)
+                .fixedSize(horizontal: false, vertical: true)
 
-                Text(model.mapReadinessText)
-                Text(model.mapReadinessScoreText)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(model.localizationConfidenceText)
-                Text(model.poseStabilityText)
-                if let anchorOp = model.anchorOperationMessage {
-                    Text("Anchors: \(anchorOp)")
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let ping = model.anchorPingText {
-                    Text("Ping: \(ping)")
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let conflict = model.localizationConflictText {
-                    Text(conflict)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                DisclosureGroup("Relocalization & Fallback Details", isExpanded: $showRelocalizationDetails) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(model.arkitVsAppStateText)
-                        Text(model.meshOverrideStatusText)
-                        Text(model.worldOriginShiftDebugText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(model.localizationEventCountText)
-                        Text(model.localizationLastEventText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(model.relocalizationAttemptModeText)
-                        Text(model.relocalizationAttemptProgressText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(model.meshFallbackText)
-                        Text(model.meshFallbackPhaseText)
-                        Text(model.meshFallbackConfidenceText)
-                        Text(model.fallbackModeText)
-                        Text(model.fallbackConfidenceBandText)
-                        Text(model.fallbackLatencyMsText)
-                        Text(model.meshPoseSeedText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if model.fallbackNeedsConfirmation {
-                            Text(model.fallbackConfirmationPromptText ?? "Provisional alignment found.")
-                                .foregroundStyle(.yellow)
-                                .fixedSize(horizontal: false, vertical: true)
-                            HStack(spacing: 8) {
-                                Button("Confirm Fallback") {
-                                    model.confirmFallbackAlignment()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                Button("Reject") {
-                                    model.rejectFallbackAlignment()
-                                }
-                                .buttonStyle(.bordered)
-                            }
-                        }
-                        if let meshPrompt = model.meshFallbackPromptText {
-                            Text("Mesh fallback: \(meshPrompt)")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Text(model.fallbackRelocalizationText)
-                        Text(model.fallbackRelocalizationModeText)
-                        Text(model.fallbackRelocalizationConfidenceText)
-                        Text("Pipeline: \(model.relocalizationPipelineState())")
-                        Toggle("Fallback-isolation test mode", isOn: $model.meshOnlyTestModeEnabled)
-                        Text("Debug only: disables ARWorldMap relocalization attempts, keeps ARKit tracking visible for diagnostics, and keeps app state in Searching until fallback is accepted.")
-                            .font(.caption2)
-                            .foregroundStyle(.yellow)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Button("Start Fallback Now") {
-                            model.startFallbackIsolationNow()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!model.meshOnlyTestModeEnabled)
-                        if let fallbackPrompt = model.fallbackRelocalizationPromptText {
-                            Text("Fallback prompt: \(fallbackPrompt)")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if let fallback = model.relocalizationFallbackPromptText {
-                            Text("Fallback: \(fallback)")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .padding(.top, 4)
-                }
-
-                DisclosureGroup("Map Readiness / Saved Artifacts", isExpanded: $showReadinessDetails) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(model.meshArtifactStatusText)
-                        if let meshWarn = model.meshArtifactCaptureWarningText {
-                            Text("Mesh warning: \(meshWarn)")
-                                .foregroundStyle(.orange)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Text(model.roomSignatureStatusText)
-                        Text("Fallback aid: \(model.hasRoomSignatureArtifact ? "Ready" : "Unavailable")")
-                        if let sigWarn = model.roomSignatureCaptureWarningText {
-                            Text("Signature warning: \(sigWarn)")
-                                .foregroundStyle(.orange)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if let warnings = model.mapReadinessWarningsText, !warnings.isEmpty {
-                            Text("Readiness warnings: \(warnings)")
-                                .foregroundStyle(.yellow)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if let saveWarning = model.saveMapWarningText {
-                            Text("Save warning: \(saveWarning)")
-                                .foregroundStyle(.orange)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Text(model.lastSavedText)
-                    }
-                    .padding(.top, 4)
-                }
-
-                DisclosureGroup("Raw Debug Metrics", isExpanded: $showRawDebugDetails) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Mesh anchors: \(model.meshAnchorCount)  Planes: \(model.planeAnchorCount)  Features: \(model.featurePointCount)")
-                        Text(model.poseText)
-                        Text(model.poseDebugText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(model.headingJitterText)
-                    }
-                    .padding(.top, 4)
+            Picker("Workspace", selection: workspaceBinding) {
+                ForEach(WorkspaceMode.allCases) { mode in
+                    Text(mode.displayName).tag(mode)
                 }
             }
+            .pickerStyle(.segmented)
         }
         .font(.caption)
         .padding(12)
@@ -309,21 +99,20 @@ struct RoomPlanView: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
-    private var bottomControlPanel: some View {
-        VStack(spacing: 10) {
-            if model.isAnchorModePresented {
-                anchorModePanel
-            } else {
-                scanControlsPanel
-            }
+    @ViewBuilder
+    private var activeWorkspacePanel: some View {
+        switch model.workspaceMode {
+        case .scan:
+            scanPanel
+        case .anchors:
+            anchorModePanel
+        case .graph:
+            graphModePanel
         }
-        .padding(12)
-        .frame(maxWidth: .infinity)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
-    private var scanControlsPanel: some View {
-        VStack(spacing: 10) {
+    private var scanPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 Button(model.isSessionRunning ? "Pause" : "Start Scan") {
                     if model.isSessionRunning {
@@ -352,48 +141,37 @@ struct RoomPlanView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(!model.hasSavedMap)
-
-                Button("Anchors") {
-                    model.enterAnchorMode()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!model.hasSavedMap)
             }
 
-            DisclosureGroup("Saved Artifacts / Fallback Aids", isExpanded: $showScanFallbackStorageDetails) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(model.mapReadinessText)
+                Text(model.mapReadinessScoreText)
+                Text("Graph saved: \(model.hasSavedNavGraph ? "Yes" : "No")")
+                Text(model.graphValidationText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.caption)
+
+            DisclosureGroup("Diagnostics", isExpanded: $showScanDebug) {
                 VStack(alignment: .leading, spacing: 6) {
-                    if let saveWarning = model.saveMapWarningText {
-                        Text(saveWarning)
-                            .font(.caption2)
-                            .foregroundStyle(.orange)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    Text(model.roomSignatureStatusText)
-                        .font(.caption2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Text("Fallback aid: \(model.hasRoomSignatureArtifact ? "Ready" : "Unavailable")")
-                        .font(.caption2)
-                        .foregroundStyle(model.hasRoomSignatureArtifact ? .green : .secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if let sigWarn = model.roomSignatureCaptureWarningText {
-                        Text(sigWarn)
-                            .font(.caption2)
-                            .foregroundStyle(.orange)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                    Text("Mapping: \(model.mappingStatusText)")
+                    Text("Reloc: \(model.relocalizationText)")
+                    Text(model.localizationConfidenceText)
+                    Text(model.poseStabilityText)
+                    Text("Guidance: \(model.guidanceText)")
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(model.meshArtifactStatusText)
-                        .font(.caption2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if let meshWarn = model.meshArtifactCaptureWarningText {
-                        Text(meshWarn)
-                            .font(.caption2)
-                            .foregroundStyle(.orange)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                    Text(model.roomSignatureStatusText)
+                    Text(model.localizationEventCountText)
+                    Text(model.localizationLastEventText)
+                    Text(model.poseDebugText)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.top, 2)
+                .font(.caption2)
+                .padding(.top, 4)
             }
         }
+        .workspacePanelStyle()
     }
 
     private var anchorModePanel: some View {
@@ -402,15 +180,29 @@ struct RoomPlanView: View {
                 Text("Anchor Tools")
                     .font(.caption.weight(.semibold))
                 Spacer()
-                Button("Close") {
+                Button("Back to Scan") {
                     if renamingAnchorID != nil {
                         renamingAnchorID = nil
                         renameDraft = ""
                     }
-                    model.exitAnchorMode()
+                    model.setWorkspaceMode(.scan)
                 }
                 .buttonStyle(.bordered)
             }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Reloc: \(model.relocalizationText)")
+                Text(model.anchorModeStatusText)
+                if let target = model.anchorTargetPreviewText {
+                    Text("Target: \(target)")
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let ping = model.anchorPingText {
+                    Text("Ping: \(ping)")
+                }
+            }
+            .font(.caption)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             Picker("Placement", selection: $model.anchorPlacementMode) {
                 ForEach(AnchorPlacementMode.allCases) { mode in
@@ -420,9 +212,9 @@ struct RoomPlanView: View {
             .pickerStyle(.segmented)
 
             anchorControls
-
             anchorList
         }
+        .workspacePanelStyle()
     }
 
     private var anchorControls: some View {
@@ -446,22 +238,16 @@ struct RoomPlanView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!model.anchorPlacementAllowed)
 
+                Spacer()
                 Text("\(model.anchors.count) saved")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-
-                Spacer()
             }
 
             if let reason = model.anchorPlacementBlockReason, !model.anchorPlacementAllowed {
                 Text(reason)
                     .font(.caption2)
                     .foregroundStyle(.yellow)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else if let target = model.anchorTargetPreviewText {
-                Text(target)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -482,7 +268,7 @@ struct RoomPlanView: View {
                 }
             }
         }
-        .frame(maxHeight: 220)
+        .frame(maxHeight: 240)
     }
 
     private func anchorRow(_ anchor: SavedSemanticAnchor) -> some View {
@@ -496,6 +282,11 @@ struct RoomPlanView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Link Nearest") {
+                    model.autoLinkNearestWaypointToAnchor(anchorID: anchor.id)
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.navGraph.nodes.isEmpty)
             }
 
             if renamingAnchorID == anchor.id {
@@ -528,15 +319,9 @@ struct RoomPlanView: View {
                     .buttonStyle(.bordered)
 
                     Button("Delete", role: .destructive) {
-                        if renamingAnchorID == anchor.id {
-                            renamingAnchorID = nil
-                            renameDraft = ""
-                        }
                         model.deleteAnchor(id: anchor.id)
                     }
                     .buttonStyle(.bordered)
-
-                    Spacer()
                 }
             }
         }
@@ -545,7 +330,208 @@ struct RoomPlanView: View {
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
     }
 
-    private var anchorReticleOverlay: some View {
+    private var graphModePanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Button("Add Waypoint") {
+                    model.addWaypointAtAimPoint()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!model.graphPlacementAllowed)
+
+                Button("Save Graph") {
+                    model.saveNavGraphToDisk()
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button("Validate") {
+                    model.validateNavGraph()
+                }
+                .buttonStyle(.bordered)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(model.graphTargetPreviewText ?? "Aim at floor to place waypoint")
+                    .fixedSize(horizontal: false, vertical: true)
+                if let reason = model.graphPlacementBlockReason, !model.graphPlacementAllowed {
+                    Text(reason)
+                        .foregroundStyle(.yellow)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let status = model.graphStatusMessage {
+                    Text(status)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(model.graphValidationText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.caption)
+
+            graphSelectionPanel
+            graphWaypointsList
+            graphEdgesList
+        }
+        .workspacePanelStyle()
+    }
+
+    private var graphSelectionPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let selectedNodeID = model.selectedGraphNodeID,
+               let node = model.navGraph.nodes.first(where: { $0.id == selectedNodeID }) {
+                Text("Selected: \(node.name)")
+                    .font(.caption.weight(.semibold))
+
+                HStack(spacing: 8) {
+                    TextField("Waypoint name", text: $model.graphDraftName)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Rename") {
+                        model.renameSelectedWaypoint(to: model.graphDraftName)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("Delete", role: .destructive) {
+                        model.deleteSelectedWaypoint()
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                HStack(spacing: 8) {
+                    Menu("Connect To") {
+                        ForEach(model.navGraph.nodes.filter { $0.id != selectedNodeID }) { candidate in
+                            Button(candidate.name) {
+                                model.connectSelectedWaypoint(to: candidate.id)
+                            }
+                        }
+                    }
+                    .disabled(model.navGraph.nodes.count < 2)
+
+                    Menu("Link Anchor") {
+                        if model.anchors.isEmpty {
+                            Text("No anchors")
+                        } else {
+                            ForEach(model.anchors) { anchor in
+                                Button(anchor.name) {
+                                    model.linkSelectedWaypointToAnchor(anchor.id)
+                                }
+                            }
+                        }
+                    }
+
+                    Button("Clear Link") {
+                        model.linkSelectedWaypointToAnchor(nil)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                if let link = model.graphAnchorLinkText {
+                    Text("Linked anchor: \(link)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("No waypoint selected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var graphWaypointsList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Waypoints")
+                .font(.caption.weight(.semibold))
+
+            ScrollView {
+                VStack(spacing: 8) {
+                    if model.navGraph.nodes.isEmpty {
+                        Text("No waypoints yet")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ForEach(model.navGraph.nodes) { node in
+                            Button {
+                                model.selectWaypoint(node.id)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(node.name)
+                                        Text(String(format: "x %.2f z %.2f", node.position.x, node.position.z))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if let linkedAnchorID = node.linkedAnchorID,
+                                       let anchor = model.anchors.first(where: { $0.id == linkedAnchorID }) {
+                                        Text(anchor.name)
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                    }
+                                }
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(model.selectedGraphNodeID == node.id ? Color.white.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 170)
+        }
+    }
+
+    private var graphEdgesList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Edges")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                if model.selectedGraphEdgeID != nil {
+                    Button("Remove Edge", role: .destructive) {
+                        model.deleteSelectedEdge()
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            ScrollView {
+                VStack(spacing: 8) {
+                    if model.navGraph.edges.isEmpty {
+                        Text("No edges yet")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ForEach(model.navGraph.edges) { edge in
+                            let fromName = model.navGraph.nodes.first(where: { $0.id == edge.fromNodeID })?.name ?? "Unknown"
+                            let toName = model.navGraph.nodes.first(where: { $0.id == edge.toNodeID })?.name ?? "Unknown"
+                            Button {
+                                model.selectedGraphEdgeID = edge.id
+                                model.selectedGraphNodeID = nil
+                                model.refreshGraphSceneOverlays()
+                            } label: {
+                                HStack {
+                                    Text("\(fromName) -> \(toName)")
+                                    Spacer()
+                                    Text(String(format: "%.2fm", edge.distanceMeters))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .font(.caption)
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(model.selectedGraphEdgeID == edge.id ? Color.white.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 130)
+        }
+    }
+
+    private var centerReticleOverlay: some View {
         VStack {
             Spacer()
         }
@@ -569,22 +555,36 @@ struct RoomPlanView: View {
     }
 
     private var reticleColor: Color {
-        if !model.isAnchorModePresented { return .clear }
-        if model.anchorPlacementAllowed { return .green }
-        if model.anchorPlacementMode == .aimedRaycast,
-           model.anchorTargetPreviewText?.localizedCaseInsensitiveContains("No target") == true {
-            return .yellow
+        switch model.workspaceMode {
+        case .anchors:
+            if model.anchorPlacementAllowed { return .green }
+            return model.anchorTargetPreviewText?.localizedCaseInsensitiveContains("No target") == true ? .yellow : .red
+        case .graph:
+            if model.graphPlacementAllowed { return .green }
+            return model.graphPlacementBlockReason?.localizedCaseInsensitiveContains("floor") == true ? .yellow : .red
+        case .scan:
+            return .clear
         }
-        return .red
     }
 
     private var reticleLabel: String {
-        if model.anchorPlacementAllowed { return "Ready" }
-        if model.anchorPlacementMode == .aimedRaycast,
-           model.anchorTargetPreviewText?.localizedCaseInsensitiveContains("No target") == true {
-            return "No Surface"
+        switch model.workspaceMode {
+        case .anchors:
+            return model.anchorPlacementAllowed ? "Anchor Ready" : "Aim Anchor"
+        case .graph:
+            return model.graphPlacementAllowed ? "Waypoint Ready" : "Aim Floor"
+        case .scan:
+            return ""
         }
-        return "Relocalize"
+    }
+}
+
+private extension View {
+    func workspacePanelStyle() -> some View {
+        self
+            .padding(12)
+            .frame(maxWidth: .infinity)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 }
 
