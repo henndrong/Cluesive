@@ -25,18 +25,13 @@ struct RoomPlanView: View {
     @State private var renamingAnchorID: UUID?
     @State private var renameDraft = ""
     @State private var showScanDebug = false
+    @State private var showDestinationSelector = false
+    @State private var showAnchorLinkSelector = false
 
     private var workspaceBinding: Binding<WorkspaceMode> {
         Binding(
             get: { model.workspaceMode },
             set: { model.setWorkspaceMode($0) }
-        )
-    }
-
-    private var destinationBinding: Binding<UUID?> {
-        Binding(
-            get: { model.selectedDestinationAnchorID },
-            set: { model.selectDestinationAnchor($0) }
         )
     }
 
@@ -74,6 +69,12 @@ struct RoomPlanView: View {
         .onChange(of: model.anchorPlacementMode) { _, _ in
             model.refreshAnchorTargetPreview()
             model.refreshAnchorActionAvailability()
+        }
+        .sheet(isPresented: $showDestinationSelector) {
+            destinationSelectionSheet
+        }
+        .sheet(isPresented: $showAnchorLinkSelector) {
+            anchorLinkSelectionSheet
         }
     }
 
@@ -160,7 +161,7 @@ struct RoomPlanView: View {
             .font(.caption)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("Navigation Prep")
+                Text("Navigation")
                     .font(.caption.weight(.semibold))
 
                 if model.linkedDestinationAnchors.isEmpty {
@@ -168,13 +169,17 @@ struct RoomPlanView: View {
                         .font(.caption2)
                         .foregroundStyle(.yellow)
                 } else {
-                    Picker("Destination", selection: destinationBinding) {
-                        Text("Select destination").tag(Optional<UUID>.none)
-                        ForEach(model.linkedDestinationAnchors) { anchor in
-                            Text(anchor.name).tag(Optional(anchor.id))
+                    Button {
+                        showDestinationSelector = true
+                    } label: {
+                        HStack {
+                            Text("Destination")
+                            Spacer()
+                            Text(selectedDestinationName)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                    .pickerStyle(.menu)
+                    .buttonStyle(.bordered)
                 }
 
                 HStack(spacing: 10) {
@@ -193,12 +198,23 @@ struct RoomPlanView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.isOrientationActive && !model.canStartOrientation)
+
+                    if model.isNavigationActive {
+                        Button("Stop Navigation") {
+                            model.stopNavigation()
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
 
                 Text(model.orientationReadinessText)
                 Text(model.plannedRouteSummaryText)
                 Text(model.orientationStatusText)
                 Text(model.orientationDeltaText)
+                Text(model.navigationStatusText)
+                Text(model.navigationInstructionText)
+                Text(model.navigationProgressText)
+                Text(model.navigationRemainingDistanceText)
                 if model.orientationReadyToNavigate {
                     Text("Ready to navigate")
                         .foregroundStyle(.green)
@@ -459,17 +475,11 @@ struct RoomPlanView: View {
                     }
                     .disabled(model.navGraph.nodes.count < 2)
 
-                    Menu("Link Anchor") {
-                        if model.anchors.isEmpty {
-                            Text("No anchors")
-                        } else {
-                            ForEach(model.anchors) { anchor in
-                                Button(anchor.name) {
-                                    model.linkSelectedWaypointToAnchor(anchor.id)
-                                }
-                            }
-                        }
+                    Button("Link Anchor") {
+                        showAnchorLinkSelector = true
                     }
+                    .buttonStyle(.bordered)
+                    .disabled(model.anchors.isEmpty)
 
                     Button("Clear Link") {
                         model.linkSelectedWaypointToAnchor(nil)
@@ -606,6 +616,88 @@ struct RoomPlanView: View {
                     .background(.ultraThinMaterial, in: Capsule())
             }
         }
+    }
+
+    private var selectedDestinationName: String {
+        guard let selectedID = model.selectedDestinationAnchorID else { return "Select destination" }
+        return model.linkedDestinationAnchors.first(where: { $0.id == selectedID })?.name ?? "Select destination"
+    }
+
+    private var selectedWaypointName: String {
+        guard let selectedID = model.selectedGraphNodeID else { return "Waypoint" }
+        return model.navGraph.nodes.first(where: { $0.id == selectedID })?.name ?? "Waypoint"
+    }
+
+    private var destinationSelectionSheet: some View {
+        NavigationStack {
+            List {
+                Button("Clear Selection") {
+                    model.selectDestinationAnchor(nil)
+                    showDestinationSelector = false
+                }
+
+                ForEach(model.linkedDestinationAnchors) { anchor in
+                    Button {
+                        model.selectDestinationAnchor(anchor.id)
+                        showDestinationSelector = false
+                    } label: {
+                        HStack {
+                            Text(anchor.name)
+                            Spacer()
+                            if model.selectedDestinationAnchorID == anchor.id {
+                                Text("Selected")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Destination")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        showDestinationSelector = false
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private var anchorLinkSelectionSheet: some View {
+        NavigationStack {
+            List {
+                if model.anchors.isEmpty {
+                    Text("No anchors")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.anchors) { anchor in
+                        Button {
+                            model.linkSelectedWaypointToAnchor(anchor.id)
+                            showAnchorLinkSelector = false
+                        } label: {
+                            HStack {
+                                Text(anchor.name)
+                                Spacer()
+                                if model.graphAnchorLinkText == anchor.name {
+                                    Text("Linked")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Link \(selectedWaypointName)")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        showAnchorLinkSelector = false
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
     }
 
     private var reticleColor: Color {

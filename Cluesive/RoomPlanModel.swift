@@ -107,6 +107,11 @@ final class RoomPlanModel: NSObject, ObservableObject {
     @Published var orientationDeltaText = "Orientation delta: n/a"
     @Published var orientationReadyToNavigate = false
     @Published var isOrientationActive = false
+    @Published var navigationStatusText = "Navigation: idle"
+    @Published var navigationProgressText = "Navigation progress: n/a"
+    @Published var navigationRemainingDistanceText = "Remaining distance: n/a"
+    @Published var navigationInstructionText = "Instruction: n/a"
+    @Published var isNavigationActive = false
     @Published var meshOnlyTestModeEnabled = false {
         didSet {
             if meshOnlyTestModeEnabled {
@@ -206,6 +211,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
     private var graphPreviewSceneNode: SCNNode?
     private let speechGuidanceService = SpeechGuidanceService()
     private let hapticGuidanceService = HapticGuidanceService()
+    private var feedbackServicesWarmed = false
     private var localizationReadinessSnapshot = LocalizationReadinessSnapshot(
         state: .notReady,
         confidence: 0,
@@ -216,6 +222,48 @@ final class RoomPlanModel: NSObject, ObservableObject {
     private var orientationTarget: OrientationTarget?
     private var orientationState = OrientationCoordinator.State(alignedSince: nil)
     private var lastOrientationSnapshot: OrientationGuidanceSnapshot?
+    private var activeNavigationState = NavigationProgressCoordinator.State(
+        activeRoute: nil,
+        currentSegmentIndex: 0,
+        lastPromptState: nil,
+        rerouteRequestedAt: nil,
+        lastAnnouncedSegmentIndex: nil,
+        lastProgressDistanceMeters: nil,
+        lastOffRouteAt: nil,
+        nextSegmentCommitCandidateIndex: nil,
+        nextSegmentCommitSince: nil,
+        startedAt: .distantPast
+    )
+    private var lastNavigationSnapshot: NavigationGuidanceSnapshot?
+    private var lastMainActorFrameUpdateAt: Date = .distantPast
+    private var lastModeSpecificPreviewRefreshAt: Date = .distantPast
+    private let mainActorFrameUpdateIntervalSeconds: TimeInterval = 0.05
+    private let modeSpecificPreviewRefreshIntervalSeconds: TimeInterval = 0.12
+
+    private var effectiveMainActorFrameUpdateIntervalSeconds: TimeInterval {
+        if isNavigationActive || isOrientationActive {
+            return mainActorFrameUpdateIntervalSeconds
+        }
+        switch workspaceMode {
+        case .scan:
+            return 0.2
+        case .anchors:
+            return 0.15
+        case .graph:
+            return 0.18
+        }
+    }
+
+    private var effectiveModeSpecificPreviewRefreshIntervalSeconds: TimeInterval {
+        switch workspaceMode {
+        case .scan:
+            return 0.25
+        case .anchors:
+            return 0.18
+        case .graph:
+            return 0.22
+        }
+    }
 
     override init() {
         super.init()
@@ -260,6 +308,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         refreshLocalizationEventLogStatus()
         loadNavGraphFromDisk()
         refreshGraphSceneOverlays()
+        warmUpFeedbackServicesIfNeeded()
     }
 
     func startFreshScan() {
@@ -279,6 +328,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         lastRuntimeVisionKeyframeCaptureAt = .distantPast
         resetAppLocalizationStateForNewAttempt()
         resetNavigationPrepState()
+        warmUpFeedbackServicesIfNeeded()
     }
 
     func stopScan() {
@@ -286,6 +336,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         isSessionRunning = false
         statusMessage = "Session paused"
         stopOrientation()
+        stopNavigation()
     }
 
     func saveCurrentMap() {
@@ -563,10 +614,13 @@ final class RoomPlanModel: NSObject, ObservableObject {
         let confidencePercent = Int((max(0, min(1, localizationReadinessSnapshot.confidence)) * 100).rounded())
         orientationReadinessText = "Orientation readiness: \(localizationReadinessSnapshot.state.displayLabel) (\(confidencePercent)%)"
         if localizationReadinessSnapshot.state != .ready {
-            clearPlannedRoute()
             if isOrientationActive {
                 stopOrientation()
                 orientationStatusText = "Orientation: paused"
+            }
+            if isNavigationActive {
+                navigationStatusText = "Navigation: paused"
+                navigationInstructionText = "Instruction: Hold still while localization recovers."
             }
         }
     }
@@ -1631,6 +1685,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
 
     func selectDestinationAnchor(_ anchorID: UUID?) {
         selectedDestinationAnchorID = anchorID
+        stopNavigation()
         clearPlannedRoute()
         orientationStatusText = anchorID == nil ? "Orientation: destination not selected" : "Orientation: destination selected"
     }
@@ -1659,13 +1714,17 @@ final class RoomPlanModel: NSObject, ObservableObject {
             anchors: anchors
         ) {
         case .success(let route):
+            stopNavigation()
             plannedRoute = route
             orientationTarget = OrientationCoordinator.makeTarget(route: route)
             let destinationName = anchors.first(where: { $0.id == destinationAnchorID })?.name ?? "destination"
             let distanceText = String(format: "%.1fm", route.totalDistanceMeters)
             plannedRouteSummaryText = "Route: \(route.segments.count) segment(s), \(distanceText) to \(destinationName)"
             graphStatusMessage = "Route planned"
+            navigationStatusText = "Navigation: ready"
+            navigationRemainingDistanceText = "Remaining distance: \(distanceText)"
         case .failure(let error):
+            stopNavigation()
             clearPlannedRoute()
             graphStatusMessage = error.displayMessage
         }
@@ -1700,11 +1759,93 @@ final class RoomPlanModel: NSObject, ObservableObject {
         hapticGuidanceService.stop()
     }
 
+    func startNavigation() {
+        guard localizationReadinessSnapshot.state == .ready else {
+            navigationStatusText = "Navigation: waiting for localization"
+            return
+        }
+        guard let plannedRoute else {
+            navigationStatusText = "Navigation: waiting for route"
+            return
+        }
+        isNavigationActive = true
+        activeNavigationState = NavigationProgressCoordinator.start(route: plannedRoute, now: Date())
+        lastNavigationSnapshot = nil
+        navigationStatusText = "Navigation: active"
+        navigationInstructionText = "Instruction: Walk forward."
+        navigationProgressText = plannedRoute.segments.isEmpty
+            ? "Navigation progress: destination reached"
+            : "Navigation progress: Segment 1 of \(plannedRoute.segments.count)"
+        navigationRemainingDistanceText = String(format: "Remaining distance: %.1fm", plannedRoute.totalDistanceMeters)
+    }
+
+    func stopNavigation() {
+        isNavigationActive = false
+        activeNavigationState = NavigationProgressCoordinator.State(
+            activeRoute: nil,
+            currentSegmentIndex: 0,
+            lastPromptState: nil,
+            rerouteRequestedAt: nil,
+            lastAnnouncedSegmentIndex: nil,
+            lastProgressDistanceMeters: nil,
+            lastOffRouteAt: nil,
+            nextSegmentCommitCandidateIndex: nil,
+            nextSegmentCommitSince: nil,
+            startedAt: .distantPast
+        )
+        lastNavigationSnapshot = nil
+        navigationStatusText = "Navigation: idle"
+        navigationProgressText = "Navigation progress: n/a"
+        navigationRemainingDistanceText = "Remaining distance: n/a"
+        navigationInstructionText = "Instruction: n/a"
+        speechGuidanceService.stop()
+        hapticGuidanceService.stop()
+    }
+
+    func replanActiveNavigationFromCurrentPose() {
+        guard let destinationAnchorID = selectedDestinationAnchorID else {
+            navigationStatusText = "Navigation: waiting for destination"
+            return
+        }
+        guard let currentPoseTransform else {
+            navigationStatusText = "Navigation: paused"
+            navigationInstructionText = "Instruction: Hold still while localization recovers."
+            return
+        }
+
+        switch NavigationPlanner.planRoute(
+            currentPose: currentPoseTransform,
+            destinationAnchorID: destinationAnchorID,
+            graph: navGraph,
+            anchors: anchors
+        ) {
+        case .success(let route):
+            plannedRoute = route
+            orientationTarget = OrientationCoordinator.makeTarget(route: route)
+            activeNavigationState = NavigationProgressCoordinator.start(route: route, now: Date())
+            let distanceText = String(format: "%.1fm", route.totalDistanceMeters)
+            plannedRouteSummaryText = "Route: \(route.segments.count) segment(s), \(distanceText) to \(destinationName(for: destinationAnchorID))"
+            navigationStatusText = "Navigation: active"
+            navigationInstructionText = "Instruction: Rerouting."
+            navigationProgressText = route.segments.isEmpty
+                ? "Navigation progress: destination reached"
+                : "Navigation progress: Segment 1 of \(route.segments.count)"
+            navigationRemainingDistanceText = "Remaining distance: \(distanceText)"
+            speechGuidanceService.speakIfNeeded(promptText: "Rerouting.")
+            hapticGuidanceService.playIfNeeded(.pause)
+        case .failure(let error):
+            navigationStatusText = "Navigation: paused"
+            navigationInstructionText = "Instruction: \(error.displayMessage)"
+            graphStatusMessage = error.displayMessage
+        }
+    }
+
     func clearPlannedRoute() {
         plannedRoute = nil
         orientationTarget = nil
         plannedRouteSummaryText = "Route: none"
         orientationReadyToNavigate = false
+        stopNavigation()
         if isOrientationActive {
             stopOrientation()
         } else {
@@ -1724,6 +1865,7 @@ final class RoomPlanModel: NSObject, ObservableObject {
         selectedDestinationAnchorID = nil
         clearPlannedRoute()
         stopOrientation()
+        stopNavigation()
         orientationReadinessText = "Orientation readiness: Not Ready"
     }
 
@@ -1744,6 +1886,25 @@ final class RoomPlanModel: NSObject, ObservableObject {
         refreshGraphPlacementPreview()
         refreshGraphActionAvailability()
         refreshGraphSceneOverlays()
+    }
+
+    private func refreshModeSpecificRealtimeUI(now: Date = Date()) {
+        guard now.timeIntervalSince(lastModeSpecificPreviewRefreshAt) >= effectiveModeSpecificPreviewRefreshIntervalSeconds else {
+            return
+        }
+        lastModeSpecificPreviewRefreshAt = now
+
+        switch workspaceMode {
+        case .scan:
+            refreshAnchorActionAvailability()
+            refreshGraphActionAvailability()
+        case .anchors:
+            refreshAnchorTargetPreview()
+            refreshAnchorActionAvailability()
+        case .graph:
+            refreshGraphPlacementPreview()
+            refreshGraphActionAvailability()
+        }
     }
 
     func enterAnchorMode() {
@@ -2080,6 +2241,8 @@ final class RoomPlanModel: NSObject, ObservableObject {
         }
 
         let position = hit.worldTransform.translation
+        let previousPreview = latestGraphPlacementPreview
+        let previousPreviewText = graphTargetPreviewText
         if navGraph.nodes.contains(where: { GraphManager.edgeDistance(from: $0.position, to: position) < minimumEdgeDistanceMeters }) {
             latestGraphPlacementPreview = GraphPlacementPreview(isValid: false, worldPosition: nil, reason: "Waypoint too close to existing waypoint")
             graphTargetPreviewText = "Waypoint too close to existing waypoint"
@@ -2088,7 +2251,28 @@ final class RoomPlanModel: NSObject, ObservableObject {
             graphTargetPreviewText = String(format: "Aim target: x %.2f z %.2f", position.x, position.z)
         }
         refreshGraphActionAvailability()
-        refreshGraphSceneOverlays()
+        if graphPreviewNeedsSceneRefresh(previousPreview: previousPreview, newPreview: latestGraphPlacementPreview, previousText: previousPreviewText, newText: graphTargetPreviewText) {
+            refreshGraphSceneOverlays()
+        }
+    }
+
+    private func graphPreviewNeedsSceneRefresh(
+        previousPreview: GraphPlacementPreview,
+        newPreview: GraphPlacementPreview,
+        previousText: String?,
+        newText: String?
+    ) -> Bool {
+        if previousPreview.isValid != newPreview.isValid || previousPreview.reason != newPreview.reason || previousText != newText {
+            return true
+        }
+        switch (previousPreview.worldPosition, newPreview.worldPosition) {
+        case (nil, nil):
+            return false
+        case (.some, nil), (nil, .some):
+            return true
+        case let (.some(oldPosition), .some(newPosition)):
+            return GraphManager.edgeDistance(from: oldPosition, to: newPosition) >= 0.05
+        }
     }
 
     private func applyAnchorTargetPreviewState(_ state: AnchorManager.TargetPreviewState) {
@@ -2116,6 +2300,15 @@ final class RoomPlanModel: NSObject, ObservableObject {
         anchorModeStatusText = state.anchorModeStatusText
         anchorTargetingReady = state.anchorTargetingReady
         consecutiveValidRaycastFrames = state.consecutiveValidRaycastFrames
+    }
+
+    private func warmUpFeedbackServicesIfNeeded() {
+        guard !feedbackServicesWarmed else { return }
+        feedbackServicesWarmed = true
+        Task { @MainActor [weak self] in
+            self?.speechGuidanceService.prepareIfNeeded()
+            self?.hapticGuidanceService.prepareIfNeeded()
+        }
     }
 
     private func runSession(initialWorldMap: ARWorldMap?) {
@@ -2355,6 +2548,10 @@ final class RoomPlanModel: NSObject, ObservableObject {
             guidanceText = lastOrientationSnapshot?.promptText ?? "Choose a destination."
             return
         }
+        if isNavigationActive {
+            guidanceText = lastNavigationSnapshot?.promptText ?? "Walk forward."
+            return
+        }
         if appLocalizationState == .conflict || appLocalizationState == .degraded {
             guidanceText = appLocalizationPromptText
             return
@@ -2434,8 +2631,129 @@ final class RoomPlanModel: NSObject, ObservableObject {
         hapticGuidanceService.playIfNeeded(snapshot.hapticPattern)
 
         if snapshot.isAligned {
+            speechGuidanceService.stop()
+            hapticGuidanceService.stop()
             isOrientationActive = false
+            startNavigation()
         }
+    }
+
+    private func updateNavigationGuidance(currentYaw: Float, trackingState: ARCamera.TrackingState) {
+        refreshLocalizationReadiness(trackingState: trackingState)
+
+        guard isNavigationActive else { return }
+
+        let outcome = NavigationProgressCoordinator.update(
+            state: activeNavigationState,
+            inputs: .init(
+                readinessState: localizationReadinessSnapshot.state,
+                route: plannedRoute,
+                currentPose: currentPoseTransform,
+                currentHeadingDegrees: currentYaw * 180 / .pi,
+                isPoseStable: isPoseStableForAnchorActions,
+                now: Date()
+            )
+        )
+        activeNavigationState = outcome.state
+        var snapshot = outcome.snapshot
+        if snapshot.hasArrived {
+            let prompt = "Arrived at \(destinationName(for: plannedRoute?.destinationAnchorID))."
+            snapshot = NavigationGuidanceSnapshot(
+                state: snapshot.state,
+                currentSegmentIndex: snapshot.currentSegmentIndex,
+                segmentCount: snapshot.segmentCount,
+                distanceToSegmentEndMeters: snapshot.distanceToSegmentEndMeters,
+                distanceToDestinationMeters: snapshot.distanceToDestinationMeters,
+                headingDeltaToSegmentDegrees: snapshot.headingDeltaToSegmentDegrees,
+                promptText: prompt,
+                hapticPattern: snapshot.hapticPattern,
+                isOffRoute: snapshot.isOffRoute,
+                hasArrived: snapshot.hasArrived,
+                shouldTriggerReplan: snapshot.shouldTriggerReplan
+            )
+        }
+        lastNavigationSnapshot = snapshot
+        navigationInstructionText = "Instruction: \(snapshot.promptText)"
+        navigationProgressText = snapshot.segmentCount == 0
+            ? "Navigation progress: destination reached"
+            : String(
+                format: "Navigation progress: Segment %d of %d | %.1fm to next point",
+                min(snapshot.currentSegmentIndex + 1, snapshot.segmentCount),
+                snapshot.segmentCount,
+                snapshot.distanceToSegmentEndMeters
+            )
+        navigationRemainingDistanceText = String(format: "Remaining distance: %.1fm", snapshot.distanceToDestinationMeters)
+        switch snapshot.state {
+        case .arrived:
+            navigationStatusText = "Navigation: arrived"
+        case .rerouting:
+            navigationStatusText = "Navigation: rerouting"
+        case .paused, .waitingForLocalization:
+            navigationStatusText = "Navigation: paused"
+        default:
+            navigationStatusText = "Navigation: active"
+        }
+        guidanceText = snapshot.promptText
+        speechGuidanceService.speakIfNeeded(snapshot)
+        hapticGuidanceService.playIfNeeded(snapshot.hapticPattern)
+
+        if snapshot.shouldTriggerReplan {
+            replanActiveNavigationFromCurrentPose()
+            return
+        }
+        if snapshot.hasArrived {
+            isNavigationActive = false
+            return
+        }
+    }
+
+    private func destinationName(for anchorID: UUID?) -> String {
+        guard let anchorID else { return "destination" }
+        return anchors.first(where: { $0.id == anchorID })?.name ?? "destination"
+    }
+
+    func configureNavigationForTesting(
+        route: PlannedRoute?,
+        selectedDestinationAnchorID: UUID? = nil,
+        currentPose: simd_float4x4? = nil,
+        readinessState: LocalizationReadinessState = .ready
+    ) {
+        plannedRoute = route
+        orientationTarget = route.flatMap { OrientationCoordinator.makeTarget(route: $0) }
+        self.selectedDestinationAnchorID = selectedDestinationAnchorID
+        currentPoseTransform = currentPose
+        localizationReadinessSnapshot = LocalizationReadinessSnapshot(
+            state: readinessState,
+            confidence: 1,
+            reason: nil,
+            recommendedPrompt: "Ready"
+        )
+    }
+
+    func forceOrientationAlignedForTesting() {
+        orientationReadyToNavigate = true
+        isOrientationActive = false
+        startNavigation()
+    }
+
+    func simulateNavigationFrameForTesting(
+        currentPose: simd_float4x4?,
+        headingDegrees: Float = 0,
+        readinessState: LocalizationReadinessState = .ready,
+        isPoseStable: Bool = true
+    ) {
+        currentPoseTransform = currentPose
+        localizationReadinessSnapshot = LocalizationReadinessSnapshot(
+            state: readinessState,
+            confidence: 1,
+            reason: nil,
+            recommendedPrompt: "Ready"
+        )
+        isPoseStableForAnchorActions = isPoseStable
+        updateNavigationGuidance(
+            currentYaw: headingDegrees * .pi / 180,
+            trackingState: readinessState == .ready ? .normal : .limited(.initializing)
+        )
     }
 
     private func currentRelocalizationGuidanceSnapshot() -> RelocalizationGuidanceSnapshot? {
@@ -2469,6 +2787,11 @@ extension RoomPlanModel: ARSessionDelegate, ARSCNViewDelegate {
         let yaw = transform.forwardYawRadians
 
         Task { @MainActor in
+            let now = Date()
+            guard now.timeIntervalSince(self.lastMainActorFrameUpdateAt) >= self.effectiveMainActorFrameUpdateIntervalSeconds else {
+                return
+            }
+            self.lastMainActorFrameUpdateAt = now
             self.featurePointCount = featureCount
             self.meshAnchorCount = meshCount
             self.planeAnchorCount = planeCount
@@ -2491,11 +2814,9 @@ extension RoomPlanModel: ARSessionDelegate, ARSCNViewDelegate {
             self.updatePoseDiagnostics(with: frame, position: position, yaw: yaw)
             self.updateAppLocalizationState(with: frame, currentYaw: yaw)
             self.updateOrientationGuidance(currentYaw: yaw, trackingState: frame.camera.trackingState)
+            self.updateNavigationGuidance(currentYaw: yaw, trackingState: frame.camera.trackingState)
             self.updateGuidance(with: frame)
-            self.refreshAnchorTargetPreview()
-            self.refreshAnchorActionAvailability()
-            self.refreshGraphPlacementPreview()
-            self.refreshGraphActionAvailability()
+            self.refreshModeSpecificRealtimeUI(now: now)
         }
     }
 

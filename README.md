@@ -6,7 +6,7 @@ The current focus is:
 - scanning and persisting indoor maps
 - relocalizing in a previously scanned space
 - semantic anchors (doors, entrances, corners, custom points)
-- accessible guidance foundations (debug ping / distance-bearing, speech+haptics planned)
+- accessible guidance with orientation and walking navigation (speech + haptics)
 
 ## Goal
 
@@ -25,12 +25,14 @@ Implemented / in progress:
 - explicit relocalization state handling
 - pose/heading debug readout
 - mesh-based relocalization alignment work (ICP-lite style refinement) and coordinator extraction refactors
+- manual waypoint graph authoring and graph-linked destinations
+- orientation-first route alignment
+- live navigation progression with reroute/pause handling
+- speech guidance and haptic guidance for orientation/navigation
 
 Planned next:
 - stronger validation of relocalization from arbitrary position/orientation
-- app-level dual localization state (ARKit + mesh override)
-- waypoint graph + routing (A*)
-- speech/haptics guidance loop
+- real-device threshold tuning for authored graphs and prompt pacing
 - accessibility polish and evaluation trials
 
 ## Tech Stack
@@ -85,5 +87,5 @@ Cluesive/
 2. Improve mesh-assisted localization fallback and conflict handling
 3. Build waypoint graph and route planning
 4. Add orientation-first guidance (heading alignment)
-5. Add navigation speech/haptics and accessibility polish
+5. Tune navigation speech/haptics and accessibility polish
 6. Run evaluation trials and document results

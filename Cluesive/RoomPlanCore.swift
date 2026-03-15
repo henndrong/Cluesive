@@ -508,6 +508,59 @@ struct PlannedRoute: Equatable {
     let totalDistanceMeters: Float
 }
 
+enum NavigationGuidanceState: String, Equatable {
+    case idle
+    case waitingForRoute
+    case waitingForLocalization
+    case walking
+    case approachingTurn
+    case turnNow
+    case rerouting
+    case paused
+    case arrived
+}
+
+enum NavigationHapticPattern: String, Equatable {
+    case none
+    case walk
+    case approach
+    case turn
+    case pause
+    case success
+}
+
+struct ActiveNavigationState: Equatable {
+    let route: PlannedRoute
+    var currentSegmentIndex: Int
+    var lastPromptState: NavigationGuidanceState?
+    var lastProgressDistanceMeters: Float?
+    var lastOffRouteAt: Date?
+    var rerouteRequestedAt: Date?
+    var lastAnnouncedSegmentIndex: Int?
+    let startedAt: Date
+}
+
+struct NavigationProgressMetrics: Equatable {
+    let projectedProgressMeters: Float
+    let crossTrackErrorMeters: Float
+    let distanceToSegmentEndMeters: Float
+    let distanceToDestinationMeters: Float
+}
+
+struct NavigationGuidanceSnapshot: Equatable {
+    let state: NavigationGuidanceState
+    let currentSegmentIndex: Int
+    let segmentCount: Int
+    let distanceToSegmentEndMeters: Float
+    let distanceToDestinationMeters: Float
+    let headingDeltaToSegmentDegrees: Float
+    let promptText: String
+    let hapticPattern: NavigationHapticPattern
+    let isOffRoute: Bool
+    let hasArrived: Bool
+    let shouldTriggerReplan: Bool
+}
+
 enum RoutePlanningError: Error, Equatable {
     case destinationAnchorNotLinked
     case graphInvalid
